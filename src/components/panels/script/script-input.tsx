@@ -8,7 +8,7 @@
  * 左栏：剧本输入（导入/创作两种模式）
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -38,6 +38,14 @@ import {
 import { Input } from "@/components/ui/input";
 import { StylePicker } from "@/components/ui/style-picker";
 import type { VisualStyleId } from "@/lib/constants/visual-styles";
+import type { PromptLanguage } from "@/types/script";
+import { useScriptStore } from "@/stores/script-store";
+
+const PROMPT_LANGUAGE_OPTIONS = [
+  { value: "zh", label: "仅中文" },
+  { value: "en", label: "仅英文" },
+  { value: "zh+en", label: "中英文" },
+];
 
 const DURATION_OPTIONS = [
   { value: "auto", label: "自动" },
@@ -111,6 +119,9 @@ interface ScriptInputProps {
   sceneCalibrationStatus?: 'idle' | 'calibrating' | 'completed' | 'error';
   // 二次校准追踪（中栏独立按钮触发）
   secondPassTypes?: Set<string>;
+  // 提示词语言
+  promptLanguage?: PromptLanguage;
+  onPromptLanguageChange?: (value: PromptLanguage) => void;
 }
 
 export function ScriptInput({
@@ -144,15 +155,39 @@ export function ScriptInput({
   characterCalibrationStatus,
   sceneCalibrationStatus,
   secondPassTypes,
+  promptLanguage,
+  onPromptLanguageChange,
 }: ScriptInputProps) {
-  const [mode, setMode] = useState<"import" | "create">("import");
-  const [idea, setIdea] = useState("");
+  const scriptActiveProjectId = useScriptStore((state) => state.activeProjectId);
+  const inputDraft = useScriptStore((state) => {
+    if (!state.activeProjectId) return null;
+    return state.projects[state.activeProjectId]?.inputDraft || null;
+  });
+  const setInputDraft = useScriptStore((state) => state.setInputDraft);
+
+  const [mode, setMode] = useState<"import" | "create">(inputDraft?.mode || "import");
+  const [idea, setIdea] = useState(inputDraft?.idea || "");
   const [isGenerating, setIsGenerating] = useState(false);
   const [showCustomShotInput, setShowCustomShotInput] = useState(false);
   const [customShotValue, setCustomShotValue] = useState("");
   const [isImporting, setIsImporting] = useState(false);
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [isGeneratingSynopsis, setIsGeneratingSynopsis] = useState(false);
+
+  // Reload persisted draft when project switches
+  useEffect(() => {
+    setMode(inputDraft?.mode || "import");
+    setIdea(inputDraft?.idea || "");
+  }, [scriptActiveProjectId, inputDraft?.mode, inputDraft?.idea]);
+
+  // Persist mode/idea draft to survive panel switching
+  useEffect(() => {
+    if (!scriptActiveProjectId) return;
+    const timer = window.setTimeout(() => {
+      setInputDraft(scriptActiveProjectId, { mode, idea });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [scriptActiveProjectId, mode, idea, setInputDraft]);
 
   const handleGenerate = async () => {
     if (!idea.trim() || !onGenerateFromIdea) return;
@@ -210,7 +245,7 @@ export function ScriptInput({
         </TabsList>
 
         {/* 导入模式 */}
-        <TabsContent value="import" className="flex-1 mt-3">
+        <TabsContent value="import" className="flex-1 mt-3 overflow-y-auto">
           <div className="space-y-2">
             <Label className="text-xs text-muted-foreground">
               粘贴完整剧本（包含大纲、人物小传、各集内容）
@@ -219,7 +254,7 @@ export function ScriptInput({
               placeholder="支持的格式：\n• 第X集（集标记）\n• **1-1日 内 地点**（场景头）\n• 人物：角色A、角色B\n• 角色名：（动作）台词\n• △动作描写\n• 【字幕】【闪回】等"
               value={rawScript}
               onChange={(e) => onRawScriptChange(e.target.value)}
-              className="min-h-[200px] resize-none text-sm"
+              className="min-h-[200px] max-h-[40vh] resize-none text-sm overflow-y-auto"
               disabled={parseStatus === "parsing" || isImporting}
             />
             {/* 导入状态提示 */}
@@ -479,6 +514,29 @@ export function ScriptInput({
               </Select>
             </div>
 
+            <div className="space-y-1">
+              <Label className="text-xs">提示词语言</Label>
+              <Select
+                value={promptLanguage || "zh"}
+                onValueChange={(v) => onPromptLanguageChange?.(v as PromptLanguage)}
+                disabled={parseStatus === "parsing"}
+              >
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PROMPT_LANGUAGE_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[10px] text-muted-foreground">
+                控制AI校准生成中/英文提示词，默认仅中文可减少生成压力
+              </p>
+            </div>
+
             <div className="grid grid-cols-2 gap-2">
               <div className="space-y-1">
                 <Label className="text-xs">场景数量（可选）</Label>
@@ -587,6 +645,28 @@ export function ScriptInput({
         {/* 创作模式：显示语言、时长、风格、场景数量、分镜数量 */}
         {mode === "create" && (
           <div className="space-y-3">
+            <div className="space-y-1">
+              <Label className="text-xs">提示词语言</Label>
+              <Select
+                value={promptLanguage || "zh"}
+                onValueChange={(v) => onPromptLanguageChange?.(v as PromptLanguage)}
+                disabled={parseStatus === "parsing"}
+              >
+                <SelectTrigger className="h-8 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PROMPT_LANGUAGE_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[10px] text-muted-foreground">
+                控制AI生成中/英文提示词，默认仅中文可减少生成压力
+              </p>
+            </div>
             <div className="grid grid-cols-3 gap-2">
               <div className="space-y-1">
                 <Label className="text-xs">语言</Label>

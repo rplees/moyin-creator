@@ -78,7 +78,7 @@ export function classifyModelByName(modelName: string): ModelCapability[] {
   // ---- 视频生成模型 ----
   const videoPatterns = [
     'veo', 'sora', 'wan', 'kling', 'runway', 'luma', 'seedance',
-    'cogvideo', 'hunyuan-video', 'minimax-video', 'pika',
+    'cogvideo', 'hunyuan-video', 'minimax-video', 'hailuo', 'pika',
     'gen-3', 'gen3', 'mochi', 'ltx',
   ];
   // 精确匹配：grok-video 类
@@ -87,9 +87,9 @@ export function classifyModelByName(modelName: string): ModelCapability[] {
 
   // ---- 图片生成模型 ----
   const imageGenPatterns = [
-    'dall-e', 'dalle', 'flux', 'midjourney', 'imagen', 'cogview',
+    'dall-e', 'dalle', 'flux', 'midjourney', 'niji', 'imagen', 'cogview',
     'gpt-image', 'ideogram', 'sd3', 'stable-diffusion', 'sdxl',
-    'playground', 'recraft', 'kolors',
+    'playground', 'recraft', 'kolors', 'seedream',
   ];
   if (imageGenPatterns.some(p => name.includes(p))) return ['image_generation'];
   // "xxx-image-preview" 类（如 gemini-3-pro-image-preview）
@@ -127,6 +127,8 @@ export type ModelApiFormat =
 // MemeFast supported_endpoint_types 值 → 我们的图片 API 格式
 const IMAGE_ENDPOINT_MAP: Record<string, ModelApiFormat> = {
   'image-generation': 'openai_images',
+  'dall-e-3': 'openai_images',  // z-image-turbo, qwen-image-max 等走 /v1/images/generations
+  'aigc-image': 'openai_images', // aigc-image-gem, aigc-image-qwen
   'openai': 'openai_chat',  // 如 gpt-image-1-all 通过 chat completions 生图
 };
 
@@ -248,9 +250,41 @@ export function maskApiKey(key: string): string {
 interface BlacklistedKey {
   key: string;
   blacklistedAt: number;
+  reason?: 'rate_limit' | 'auth' | 'service_unavailable' | 'model_incompatible' | 'unknown';
+  durationMs?: number;
 }
 
 const BLACKLIST_DURATION_MS = 90 * 1000; // 90 seconds
+const MODEL_MISMATCH_BLACKLIST_DURATION_MS = 15 * 1000; // short cooldown for model mismatch
+
+function isModelIncompatibleError(errorText?: string): boolean {
+  if (!errorText) return false;
+  const text = errorText.toLowerCase();
+  return (
+    text.includes('not support') ||
+    text.includes('unsupported') ||
+    text.includes('model') && text.includes('invalid') ||
+    text.includes('model') && text.includes('not available') ||
+    text.includes('model') && text.includes('unavailable')
+  );
+}
+
+/**
+ * 检测 HTTP 500 响应体中是否包含上游负载饱和相关关键词。
+ * MemeFast 有时用 500 而非 503/529 返回负载饱和错误。
+ */
+function isUpstreamOverloadError(errorText?: string): boolean {
+  if (!errorText) return false;
+  const text = errorText.toLowerCase();
+  return (
+    text.includes('上游负载') ||
+    text.includes('负载已饱和') ||
+    text.includes('负载饱和') ||
+    text.includes('overloaded') ||
+    text.includes('无可用渠道') ||
+    text.includes('no available channel')
+  );
+}
 
 /**
  * API Key Manager with rotation and blacklist support
@@ -318,12 +352,14 @@ export class ApiKeyManager {
   /**
    * Mark the current key as failed and blacklist it temporarily
    */
-  markCurrentKeyFailed(): void {
+  markCurrentKeyFailed(reason: BlacklistedKey['reason'] = 'unknown', durationMs: number = BLACKLIST_DURATION_MS): void {
     const key = this.keys[this.currentIndex];
     if (key) {
       this.blacklist.set(key, {
         key,
         blacklistedAt: Date.now(),
+        reason,
+        durationMs,
       });
     }
     this.rotateKey();
@@ -333,10 +369,23 @@ export class ApiKeyManager {
    * Handle API errors and decide whether to rotate
    * Returns true if key was rotated
    */
-  handleError(statusCode: number): boolean {
-    // Rotate on rate limit (429), auth errors (401), or service unavailable (503)
-    if (statusCode === 429 || statusCode === 401 || statusCode === 503) {
-      this.markCurrentKeyFailed();
+  handleError(statusCode: number, errorText?: string): boolean {
+    if (statusCode === 429) {
+      this.markCurrentKeyFailed('rate_limit');
+      return true;
+    }
+    if (statusCode === 401 || statusCode === 403) {
+      this.markCurrentKeyFailed('auth');
+      return true;
+    }
+    // 所有 5xx 服务端错误均触发 key 轮转（memefast 等中转站 500 多为临时性故障）
+    if (statusCode >= 500) {
+      this.markCurrentKeyFailed('service_unavailable');
+      return true;
+    }
+
+    if (statusCode === 400 && isModelIncompatibleError(errorText)) {
+      this.markCurrentKeyFailed('model_incompatible', MODEL_MISMATCH_BLACKLIST_DURATION_MS);
       return true;
     }
     return false;
@@ -370,7 +419,8 @@ export class ApiKeyManager {
   private cleanupBlacklist(): void {
     const now = Date.now();
     for (const [key, entry] of this.blacklist.entries()) {
-      if (now - entry.blacklistedAt >= BLACKLIST_DURATION_MS) {
+      const ttl = entry.durationMs ?? BLACKLIST_DURATION_MS;
+      if (now - entry.blacklistedAt >= ttl) {
         this.blacklist.delete(key);
       }
     }
@@ -391,15 +441,20 @@ export class ApiKeyManager {
 // Global map of ApiKeyManagers per provider
 const providerManagers = new Map<string, ApiKeyManager>();
 
+function getScopedProviderKey(providerId: string, scopeKey?: string): string {
+  return scopeKey ? `${providerId}::${scopeKey}` : providerId;
+}
+
 /**
  * Get or create an ApiKeyManager for a provider
  */
-export function getProviderKeyManager(providerId: string, apiKey: string): ApiKeyManager {
-  let manager = providerManagers.get(providerId);
+export function getProviderKeyManager(providerId: string, apiKey: string, scopeKey?: string): ApiKeyManager {
+  const managerKey = getScopedProviderKey(providerId, scopeKey);
+  let manager = providerManagers.get(managerKey);
   
   if (!manager) {
     manager = new ApiKeyManager(apiKey);
-    providerManagers.set(providerId, manager);
+    providerManagers.set(managerKey, manager);
   }
   
   return manager;
@@ -408,12 +463,13 @@ export function getProviderKeyManager(providerId: string, apiKey: string): ApiKe
 /**
  * Update the keys for a provider's manager
  */
-export function updateProviderKeys(providerId: string, apiKey: string): void {
-  const manager = providerManagers.get(providerId);
+export function updateProviderKeys(providerId: string, apiKey: string, scopeKey?: string): void {
+  const managerKey = getScopedProviderKey(providerId, scopeKey);
+  const manager = providerManagers.get(managerKey);
   if (manager) {
     manager.reset(apiKey);
   } else {
-    providerManagers.set(providerId, new ApiKeyManager(apiKey));
+    providerManagers.set(managerKey, new ApiKeyManager(apiKey));
   }
 }
 

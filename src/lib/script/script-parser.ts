@@ -13,6 +13,7 @@ import { cleanJsonString, safeParseJson, normalizeIds } from "@/lib/utils/json-c
 import { delay, RATE_LIMITS } from "@/lib/utils/rate-limiter";
 import { ApiKeyManager } from "@/lib/api-key-manager";
 import { getModelLimits, parseModelLimitsFromError, cacheDiscoveredLimits, estimateTokens } from "@/lib/ai/model-registry";
+import { corsFetch } from "@/lib/cors-fetch";
 
 /**
  * Normalize time value to match scene-store TIME_PRESETS
@@ -319,7 +320,7 @@ export async function callChatAPI(
       console.log('[callChatAPI] 已关闭深度思考 (thinking: disabled)');
     }
 
-    const response = await fetch(url, {
+    const response = await corsFetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
@@ -329,7 +330,7 @@ export async function callChatAPI(
       const errorText = await response.text();
       
       // Handle rate limit or auth error with key rotation
-      if (keyManager.handleError(response.status)) {
+      if (keyManager.handleError(response.status, errorText)) {
         console.log(`[callChatAPI] Rotated to next API key due to error ${response.status}, available: ${keyManager.getAvailableKeyCount()}/${totalKeys}`);
       }
       
@@ -347,7 +348,7 @@ export async function callChatAPI(
               `以 max_tokens=${correctedMaxTokens} 自动重试...`
             );
             const retryBody = { ...body, max_tokens: correctedMaxTokens };
-            const retryResp = await fetch(url, {
+            const retryResp = await corsFetch(url, {
               method: 'POST',
               headers,
               body: JSON.stringify(retryBody),
@@ -421,7 +422,7 @@ export async function callChatAPI(
           );
           
           const retryBody = { ...body, max_tokens: newMaxTokens };
-          const retryResp = await fetch(url, {
+          const retryResp = await corsFetch(url, {
             method: 'POST',
             headers,
             body: JSON.stringify(retryBody),
@@ -693,7 +694,7 @@ ${scriptData.characters.map(c => `- ${c.name}: ${c.personality || ''} ${c.appear
           })
           .filter(Boolean) as string[];
 
-        const keyframes = [];
+        const keyframes: NonNullable<Shot['keyframes']> = [];
         if (s.keyframes && Array.isArray(s.keyframes)) {
           keyframes.push(...s.keyframes.map((k: any) => ({
             ...k,
@@ -867,7 +868,9 @@ const CREATIVE_SCRIPT_BASE_PROMPT = `你是一位专业的影视编剧和分镜�
 4. 动作描写用 △ 开头
 5. 对白格式：角色名：（动作）台词
 6. MV/广告也要拆分成场景和分镜，只是内容侧重画面和音效
-7. 语言与用户输入保持一致（中文输入用中文输出）`;
+7. 语言与用户输入保持一致（中文输入用中文输出）
+8. **时代一致性**：大纲中必须明确时代背景；人物小传中的服装、发型、道具必须严格符合该时代（如古代剧不得出现现代服装/电子产品；现代剧不得出现古代服饰）
+9. **世界观一致性**：场景地点、建筑风格、社会规则必须符合剧本设定的世界观，不得出现矛盾元素`;
 
 // 针对已有分镜结构输入的额外指令（如【镜头1】到【镜夷12】）
 const STORYBOARD_STRUCTURE_PROMPT = `

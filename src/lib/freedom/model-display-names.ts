@@ -10,7 +10,8 @@ export const MODEL_DISPLAY_NAMES: Record<string, string> = {
   // ==================== 图像模型 ====================
 
   // --- Google / Gemini ---
-  'gemini-3-pro-image-preview': 'Nano Banana 2 (Gemini 3 Pro)',
+  'gemini-3.1-pro-image-preview': 'Nano Banana 2 (Gemini 3.1 Pro)',
+  'gemini-3-pro-image-preview': 'Nano Banana Pro (Gemini 3 Pro)',
   'gemini-2.5-flash-image': 'Nano Banana (Gemini 2.5 Flash)',
   'gemini-2.5-flash-image-preview': 'Nano Banana Preview (Gemini 2.5 Flash)',
   'aigc-image-gem': 'AIGC Gemini 绘图',
@@ -138,6 +139,12 @@ export const MODEL_DISPLAY_NAMES: Record<string, string> = {
   'kling-image': 'Kling 图片生成',
   'kling-omni-image': 'Kling Omni 图片',
   'kling-image-recognize': 'Kling 图像识别',
+  // Kling 图片模型版本 (MemeFast model_version)
+  'kling-image-v1': 'Kling 图片 V1',
+  'kling-image-v1-5': 'Kling 图片 V1.5',
+  'kling-image-v2': 'Kling 图片 V2',
+  'kling-image-v2-new': 'Kling 图片 V2 New',
+  'kling-image-v2-1': 'Kling 图片 V2.1',
 
   // --- Grok / xAI ---
   'grok-3-image': 'Grok 3 Image',
@@ -233,6 +240,7 @@ export const MODEL_DISPLAY_NAMES: Record<string, string> = {
   // --- Grok Video ---
   'grok-video-3': 'Grok Video 3',
   'grok-video-3-10s': 'Grok Video 3 (10s)',
+  'grok-video-3-15s': 'Grok Video 3 (15s)',
 
   // --- Kling / 可灵 ---
   'kling-video': 'Kling 文生视频',
@@ -246,6 +254,15 @@ export const MODEL_DISPLAY_NAMES: Record<string, string> = {
   'kling-audio': 'Kling 音频生成',
   'kling-custom-voices': 'Kling 自定义音色',
   'kling-custom-elements': 'Kling 自定义主体',
+  // Kling 视频模型版本 (MemeFast model_version)
+  'kling-v1': 'Kling V1',
+  'kling-v1-5': 'Kling V1.5',
+  'kling-v1-6': 'Kling V1.6',
+  'kling-v2-master': 'Kling V2 Master',
+  'kling-v2-1': 'Kling V2.1',
+  'kling-v2-1-master': 'Kling V2.1 Master',
+  'kling-v2-5-turbo': 'Kling V2.5 Turbo',
+  'kling-v2-6': 'Kling V2.6',
 
   // --- Doubao / 豆包 / Seedance ---
   'doubao-seedance-1-0-pro-250528': 'Seedance 1.0 Pro',

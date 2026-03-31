@@ -14,10 +14,12 @@
  * 5. AI 补充角色信息（年龄、性别、关系）
  */
 
-import type { ScriptCharacter, ProjectBackground, EpisodeRawScript, CharacterIdentityAnchors, CharacterNegativePrompt } from '@/types/script';
+import type { ScriptCharacter, ProjectBackground, EpisodeRawScript, CharacterIdentityAnchors, CharacterNegativePrompt, PromptLanguage, CalibrationStrictness, FilteredCharacterRecord } from '@/types/script';
 import { callFeatureAPI } from '@/lib/ai/feature-router';
 import { processBatched } from '@/lib/ai/batch-processor';
 import { estimateTokens, safeTruncate } from '@/lib/ai/model-registry';
+import { useScriptStore } from '@/stores/script-store';
+import { buildSeriesContextSummary } from './series-meta-sync';
 
 // ==================== 类型定义 ====================
 
@@ -26,6 +28,8 @@ export interface CharacterCalibrationResult {
   characters: CalibratedCharacter[];
   /** 被过滤的词（非角色） */
   filteredWords: string[];
+  /** 被过滤的角色（带原因，用于用户确认/恢复） */
+  filteredCharacters: FilteredCharacterRecord[];
   /** 合并记录（哪些被合并到一起） */
   mergeRecords: MergeRecord[];
   /** AI 分析说明 */
@@ -82,6 +86,10 @@ export interface MergeRecord {
 export interface CalibrationOptions {
   /** 上次校准的角色列表，用于合并确保角色不丢失 */
   previousCharacters?: CalibratedCharacter[];
+  /** 提示词语言选项 */
+  promptLanguage?: PromptLanguage;
+  /** 校准严格度 */
+  strictness?: CalibrationStrictness;
 }
 
 // ==================== 从剧本重新提取角色 ====================
@@ -266,6 +274,8 @@ export async function calibrateCharacters(
   options?: CalibrationOptions
 ): Promise<CharacterCalibrationResult> {
   const previousCharacters = options?.previousCharacters;
+  const promptLanguage = options?.promptLanguage || 'zh+en';
+  const strictness = options?.strictness || 'normal';
   
   // 1. 先统计每个角色的出场情况
   const characterNames = rawCharacters.map(c => c.name);
@@ -277,7 +287,8 @@ export async function calibrateCharacters(
     const name = c.name;
     
     // 判断是否是群演（纯职业称呿、数字编号、群体描述）
-    const isGroupExtra = [
+    // loose 模式下不标记群演，全部保留给 AI 判断
+    const isGroupExtra = strictness === 'loose' ? false : [
       '保安', '警察', '员工', '护士', '医生', '记者', 
       '律师', '路人', '众人', '若干', '群众', '大妈',
     ].some(keyword => 
@@ -333,12 +344,34 @@ export async function calibrateCharacters(
   }
   const coreThreshold = Math.max(Math.floor(totalSceneCount * 0.1), 10);
   
-  const systemPrompt = `你是专业的影视剧本分析师，擅长从剧本数据中识别和校准角色。
+  // === 根据严格度生成不同的筛选指令段 ===
+  const strictnessInstructions = strictness === 'strict'
+    ? `【筛选模式：严格】
+- 只保留明确的主角、重要配角、和有具体名字的次要角色
+- 出场 ≤1 且无对白的角色过滤
+- 纯称呼没有具体名字的角色过滤（如"学习委员"、"戴眼镜的男生"）
+- 群演全部过滤`
+    : strictness === 'loose'
+    ? `【筛选模式：宽松】
+- 几乎不过滤，保留所有能识别的角色
+- 包括群演、低频角色、只有称呼的角色（如"学习委员"、"戴眼镜的男生"）
+- 只过滤纯描述词（如"眼框微湿"、"干练优雅"）和非人物词（如"全体员工"、"核心团队"）`
+    : `【筛选模式：标准】
+- 有名字或称呼的角色全部保留
+- 只过滤纯群演、群体、非角色词`;
+  
+  // 注入剧级上下文
+  const store = useScriptStore.getState();
+  const activeProjectId = store.activeProjectId;
+  const seriesMeta = activeProjectId ? store.projects[activeProjectId]?.seriesMeta : null;
+  const seriesCtx = buildSeriesContextSummary(seriesMeta || null);
+  const seriesCtxBlock = seriesCtx ? `\n\n${seriesCtx}\n` : '';
 
+  const systemPrompt = `你是专业的影视剧本分析师，擅长从剧本数据中识别和校准角色。${seriesCtxBlock}
 【核心目标】
 校准后的角色列表将用于生成角色三视图。
-- **宽松保留：有名字或称呼的角色全部保留**
-- **严格过滤：只过滤纯群演、群体、非角色词**
+
+${strictnessInstructions}
 
 【严格执行 - 保留规则】
 
@@ -347,7 +380,7 @@ export async function calibrateCharacters(
    - 例：张明、老周、苏晴
 
 **2. 重要配角 (supporting)** - 必须保留
-   - 有具体名字或昵称：刀疤哥、龙哥、李强、王艳、小乐、阿强
+   - 有具体名字或昵称：刀疑哥、龙哥、李强、王艳、小乐、阿强
    - 有固定称呼：赖董、王总、周总、李医生
    - 出场 ≥1 且有对白、或出场 ≥2
 
@@ -356,16 +389,15 @@ export async function calibrateCharacters(
    - 对剧情有一定作用
    - **只出场1次但有名字的也要保留！**
 
-**4. 群演/配角 (extra)** - 尽量保留
+**4. 群演/配角 (extra)** - ${strictness === 'strict' ? '可以过滤' : strictness === 'loose' ? '必须保留' : '尽量保留'}
    - 有称呼但出场极少的，标记为 extra
    - 例：李老头、小刘、王大妈
 
-【极其重要 - 宽松筛选原则】
+${strictness !== 'strict' ? `【极其重要 - 宽松筛选原则】
 - **有名字的全部保留！**（即使只出场1次）
 - **有称呼的全部保留！**（如老X、小X、X哥、X姐、X总、X董）
 - **不确定的保留！**（宁可多保留，不要遗漏）
-
-【严格过滤 - 只过滤这些】
+` : ''}【过滤规则】
 
 **必须过滤的（无名字的纯群演）：**
 - 纯职业词：保安、警察、护士、医生、记者、员工、律师、服务员、司机
@@ -376,19 +408,21 @@ export async function calibrateCharacters(
 
 **绝对不能过滤的：**
 - 任何有姓名的：张明、李强、王艳、林风、马克
-- 任何有昵称的：刀疤哥、龙哥、小乐、阿强、老李、小刘
+- 任何有昵称的：刀疑哥、龙哥、小乐、阿强、老李、小刘
 - 有姓氏+职业：赖董、王总、周总、李医生、张秘书、林师傅
 - 有姓氏+称谓：李老头、王大妈、周妹
 
 【合并规则】
 只合并明确是同一人的不同称呼：
 - 例："王总" 和 "投资人王总" → 合并为 "王总"
-- 例："刀疤哥" 和 "李强" 如果剧情明确是同一人 → 合并
+- 例："刀疑哥" 和 "李强" 如果剧情明确是同一人 → 合并
 
 【数量约束】
 - 主角：1-3 个
 - 配角：5-30 个（有名字的全部保留，不要限制）
 - 总角色数：建议 15-40 个，宁多勿少
+
+【重要】每个被过滤的角色请在 filteredCharacters 中说明过滤原因。
 
 请以JSON格式返回分析结果。`;
 
@@ -403,6 +437,7 @@ export async function calibrateCharacters(
     
     // 闭包收集跨批次的聚合字段
     const allFilteredWords: string[] = [];
+    const allFilteredCharacters: FilteredCharacterRecord[] = [];
     const allMergeRecords: MergeRecord[] = [];
     const allAnalysisNotes: string[] = [];
     
@@ -466,6 +501,9 @@ ${batchDialogues.slice(0, 100).join('\n')}
     }
   ],
   "filteredWords": ["被过滤的非角色词"],
+  "filteredCharacters": [
+    { "name": "被过滤的角色名", "reason": "过滤原因" }
+  ],
   "mergeRecords": [
     { "finalName": "最终名", "variants": ["变体1", "变体2"], "reason": "原因" }
   ],
@@ -473,8 +511,8 @@ ${batchDialogues.slice(0, 100).join('\n')}
 }
 
 【极其重要！请特别注意】
-1. 有名字的全部保留！有称呼的全部保留！不确定的保留！
-2. 只过滤纯职业词、数字编号、群体词
+1. ${strictness === 'strict' ? '严格过滤低频无名角色' : strictness === 'loose' ? '尽可能保留所有角色，包括群演' : '有名字的全部保留！有称呼的全部保留！不确定的保留！'}
+2. 每个被过滤的角色必须在 filteredCharacters 中说明原因
 3. 不要生成群演XX组标签`;
         return { system: systemPrompt, user };
       },
@@ -518,6 +556,12 @@ ${batchDialogues.slice(0, 100).join('\n')}
         
         // 收集聚合字段
         allFilteredWords.push(...(batchParsed.filteredWords || []));
+        if (batchParsed.filteredCharacters) {
+          allFilteredCharacters.push(...batchParsed.filteredCharacters.map((fc: any) => ({
+            name: fc.name || '',
+            reason: fc.reason || '未说明',
+          })));
+        }
         allMergeRecords.push(...(batchParsed.mergeRecords || []));
         if (batchParsed.analysisNotes) allAnalysisNotes.push(batchParsed.analysisNotes);
         
@@ -546,6 +590,7 @@ ${batchDialogues.slice(0, 100).join('\n')}
     parsed = {
       characters: Array.from(charResults.values()),
       filteredWords: [...new Set(allFilteredWords)],
+      filteredCharacters: allFilteredCharacters,
       mergeRecords: allMergeRecords,
       analysisNotes: allAnalysisNotes.join('; ') || '批处理完成',
     };
@@ -570,6 +615,7 @@ ${batchDialogues.slice(0, 100).join('\n')}
         };
       }),
       filteredWords: [],
+      filteredCharacters: [],
       mergeRecords: [],
       analysisNotes: `AI角色分析失败(${err.message})，返回基于统计的结果`,
     };
@@ -595,7 +641,8 @@ ${batchDialogues.slice(0, 100).join('\n')}
     enrichedCharacters = await enrichCharactersWithVisualPrompts(
       characters,
       background,
-      episodeScripts
+      episodeScripts,
+      promptLanguage
     );
     console.log('[CharacterCalibrator] 视觉提示词生成完成');
   } catch (enrichError) {
@@ -609,9 +656,11 @@ ${batchDialogues.slice(0, 100).join('\n')}
   if (previousCharacters && previousCharacters.length > 0) {
     const currentNames = new Set(enrichedCharacters.map(c => c.name));
     
-    // 找出上次有但这次没有的角色（排除群演）
+    // 找出上次有但这次没有的角色
     const missingCharacters = previousCharacters.filter(pc => {
       if (currentNames.has(pc.name)) return false;
+      // loose 模式下保留所有上次的角色
+      if (strictness === 'loose') return true;
       // 只保留有具体名字的角色
       const isGroupExtra = [
         '保安', '警察', '员工', '护士', '医生', '记者', 
@@ -646,9 +695,22 @@ ${batchDialogues.slice(0, 100).join('\n')}
     }
   }
   
+  // 合并 filteredWords 和 filteredCharacters，确保 filteredWords 中的也出现在 filteredCharacters
+  const filteredCharacters: FilteredCharacterRecord[] = [
+    ...(parsed.filteredCharacters || []),
+  ];
+  // 将 filteredWords 中没有在 filteredCharacters 中的也加进去
+  const filteredCharNames = new Set(filteredCharacters.map(fc => fc.name));
+  for (const word of (parsed.filteredWords || [])) {
+    if (!filteredCharNames.has(word)) {
+      filteredCharacters.push({ name: word, reason: '非角色词' });
+    }
+  }
+  
   return {
     characters: finalCharacters,
     filteredWords: parsed.filteredWords || [],
+    filteredCharacters,
     mergeRecords: parsed.mergeRecords || [],
     analysisNotes: parsed.analysisNotes || '',
   };
@@ -698,12 +760,15 @@ function collectCharacterContexts(
  */
 export function convertToScriptCharacters(
   calibrated: CalibratedCharacter[],
-  originalCharacters?: ScriptCharacter[]
+  originalCharacters?: ScriptCharacter[],
+  promptLanguage: PromptLanguage = 'zh+en',
 ): ScriptCharacter[] {
   return calibrated.map(c => {
     // 查找原始角色数据
     const original = originalCharacters?.find(orig => orig.name === c.name);
     
+    const nextVisualPromptEn = c.visualPromptEn || original?.visualPromptEn;
+    const nextVisualPromptZh = c.visualPromptZh || original?.visualPromptZh;
     // 合并：保留原始数据，只补充/更新 AI 生成的字段
     return {
       // 保留原始字段
@@ -716,8 +781,8 @@ export function convertToScriptCharacters(
       gender: c.gender || original?.gender,
       relationships: c.relationships || original?.relationships,
       // === 专业角色设计字段（世界级大师生成）===
-      visualPromptEn: c.visualPromptEn || original?.visualPromptEn,
-      visualPromptZh: c.visualPromptZh || original?.visualPromptZh,
+      visualPromptEn: promptLanguage === 'zh' ? undefined : nextVisualPromptEn,
+      visualPromptZh: promptLanguage === 'en' ? undefined : nextVisualPromptZh,
       appearance: c.facialFeatures || c.uniqueMarks || c.clothingStyle 
         ? [c.facialFeatures, c.uniqueMarks, c.clothingStyle].filter(Boolean).join(', ')
         : original?.appearance,
@@ -728,6 +793,81 @@ export function convertToScriptCharacters(
       tags: [c.importance, `出场${c.appearanceCount}次`, ...(original?.tags || [])],
     };
   });
+}
+
+/**
+ * 角色恢复兜底：优先保留带名字的角色，并去重
+ */
+function cloneScriptCharactersForRecovery(
+  characters: ScriptCharacter[] | undefined,
+  source: 'calibrated' | 'existing' | 'series-meta' | 'raw',
+): ScriptCharacter[] {
+  if (!Array.isArray(characters) || characters.length === 0) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const recovered: ScriptCharacter[] = [];
+
+  for (let index = 0; index < characters.length; index += 1) {
+    const character = characters[index];
+    const name = character?.name?.trim();
+    if (!name) continue;
+
+    const key = (character.id && character.id.trim()) || name;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    recovered.push({
+      ...character,
+      id: character.id || `char_recovered_${index + 1}`,
+      name,
+      tags: Array.isArray(character.tags) && character.tags.length > 0
+        ? [...new Set(character.tags.filter(Boolean))]
+        : source === 'raw'
+          ? ['minor', 'recovered']
+          : character.tags,
+    });
+  }
+
+  return recovered;
+}
+
+export function resolveSafeScriptCharacters(
+  preferredCharacters: ScriptCharacter[],
+  options?: {
+    existingCharacters?: ScriptCharacter[];
+    seriesMetaCharacters?: ScriptCharacter[];
+    rawCharacters?: ScriptCharacter[];
+  },
+): {
+  characters: ScriptCharacter[];
+  source: 'calibrated' | 'existing' | 'series-meta' | 'raw' | 'empty';
+} {
+  const candidates: Array<{
+    source: 'calibrated' | 'existing' | 'series-meta' | 'raw';
+    characters?: ScriptCharacter[];
+  }> = [
+    { source: 'calibrated', characters: preferredCharacters },
+    { source: 'existing', characters: options?.existingCharacters },
+    { source: 'series-meta', characters: options?.seriesMetaCharacters },
+    { source: 'raw', characters: options?.rawCharacters },
+  ];
+
+  for (const candidate of candidates) {
+    const characters = cloneScriptCharactersForRecovery(candidate.characters, candidate.source);
+    if (characters.length > 0) {
+      return {
+        characters,
+        source: candidate.source,
+      };
+    }
+  }
+
+  return {
+    characters: [],
+    source: 'empty',
+  };
 }
 
 /**
@@ -753,7 +893,8 @@ export function sortByImportance(characters: CalibratedCharacter[]): CalibratedC
 async function enrichCharactersWithVisualPrompts(
   characters: CalibratedCharacter[],
   background: ProjectBackground,
-  episodeScripts: EpisodeRawScript[]
+  episodeScripts: EpisodeRawScript[],
+  promptLanguage: PromptLanguage = 'zh+en'
 ): Promise<CalibratedCharacter[]> {
   // 只为主角和重要配角生成详细提示词
   const keyCharacters = characters.filter(c => 
@@ -804,8 +945,62 @@ async function enrichCharactersWithVisualPrompts(
 请设计符合当代中国的服装风格，年轻人穿时尚休闲装，中年人穿商务休闲装，老年人穿舒适传统服装。
 绝对不要设计成古装、汉服、或古代服饰。`;
     }
-    
-    return '';
+
+    // 民国时期
+    if (timeline.includes('民国') || timeline.includes('近代') || timeline.includes('清末')) {
+      return `【${timeline}服装指导】
+- 男性：长衫马褂、中山装、西装礼帽（上层社会）、布衣长衫（平民）
+- 女性：旗袍、女学生装（上衣下裙）、短发或盘发
+- 禁止出现T恤、牛仔裤、运动鞋等现代服饰
+- 禁止出现手机、电脑等现代电子产品`;
+    }
+
+    // 古代各朝代
+    if (/唐朝|唐代/.test(timeline)) {
+      return `【唐朝服装指导】
+- 男性：圆领袍、幞头、革带；武将可穿铠甲
+- 女性：高腰襟裙、披帛、发髀簪起、花钗装饰
+- 绝对禁止任何现代服装（西装/T恤/牵仔裤/运动鞋）`;
+    }
+    if (/宋朝|宋代/.test(timeline)) {
+      return `【宋朝服装指导】
+- 男性：直裰、交领袖衫、乌纱帽；文人偏素雅
+- 女性：褒子、裙、披帛，发型简约典雅
+- 绝对禁止任何现代服装`;
+    }
+    if (/明朝|明代/.test(timeline)) {
+      return `【明朝服装指导】
+- 男性：曳服、直裰、网巾或乌纱帽
+- 女性：交领衫、马面裙、披风，发型丰富多变
+- 绝对禁止任何现代服装`;
+    }
+    if (/清朝|清代/.test(timeline)) {
+      return `【清朝服装指导】
+- 男性：长袍马褂、瓜皮帽、辨子；官员穿补服
+- 女性：旗装（溜肩、立领、宽松）、旗头或两把头
+- 绝对禁止任何现代服装`;
+    }
+
+    // 泛古代/武侠/仙侠/宫斗/玄幻等
+    if (/古代|武侠|仙侠|玄幻|宫斗|宅斗|战国|春秋|汉朝|三国|历史/.test(timeline)) {
+      return `【${timeline}服装指导】
+- 所有角色必须穿着中国古代服饰（长袍、袖衫、披风、带子等）
+- 发型必须是古代式样（簪发、发髀、束发、发笪等）
+- 武侠/仙侠可加入飘逸江湖风格元素（剑、披风、护腕等）
+- 绝对禁止任何现代服装（西装/T恤/牛仔裤/运动鞋/手机/眼镜等）`;
+    }
+
+    // 科幻/未来
+    if (/科幻|未来|星际|太空/.test(timeline)) {
+      return `【${timeline}服装指导】
+- 可以设计未来感/科技感服装，但需保持内部一致性
+- 禁止出现与世界观不符的服装元素`;
+    }
+
+    // 其他未识别的时代 — 用通用约束而非返回空
+    return `【${timeline}服装指导】
+请根据「${timeline}」时代背景设计角色服装，服装、发型、配饰必须严格符合该时代特征。
+绝对禁止出现与该时代不符的服装元素。`;
   };
   
   const eraFashionGuidance = getEraFashionGuidance();
@@ -835,7 +1030,42 @@ ${background.outline?.slice(0, 1200) || '无'}
 【人物小传】
 ${background.characterBios?.slice(0, 1200) || '无'}
 
-【核心输出：6层身份锚点】
+${promptLanguage === 'zh' ? `【核心输出：6层身份锚点】
+这是AI生图中保持角色一致性的关键技术，必须用中文详细填写：
+
+① 骨相层（面部骨骼结构）
+   - faceShape: 脸型（鹅蛋形/方形/心形/圆形/菱形/长圆形）
+   - jawline: 下颌线（棱角分明/柔和圆润/突出方正）
+   - cheekbones: 颧骨（高颧骨/不明显/宽颧骨）
+
+② 五官层（精确描述）
+   - eyeShape: 眼型（杏仁形/圆眼/内双/单眼皮/上挑形）
+   - eyeDetails: 眼部细节（双眼皮、轻微内眦褶、深邃眼窝）
+   - noseShape: 鼻型（高鼻梁、圆鼻头、小巧挺鼻）
+   - lipShape: 唇型（丰唇、薄唇、明显的唇珠）
+
+③ 辨识标记层（最强锚点！）
+   - uniqueMarks: 必填数组！至少2-3个独特标记，用中文描述
+   - 示例：["左眼下方2cm处小痣", "右眉尾处淡疤", "左脸颊酒窝"]
+   - 这是最强的角色识别特征，必须精确到位置
+
+④ 色彩锚点层（Hex色值）
+   - colorAnchors.iris: 虹膜色（如 #3D2314 深棕色）
+   - colorAnchors.hair: 发色（如 #1A1A1A 乌黑）
+   - colorAnchors.skin: 肤色（如 #E8C4A0 暖米色）
+   - colorAnchors.lips: 唇色（如 #C4727E 豆沙粉）
+
+⑤ 皮肤纹理层
+   - skinTexture: 皮肤质感，用中文描述（毛孔清晰、淡雀斑、笑纹明显）
+
+⑥ 发型锚点层
+   - hairStyle: 发型，用中文描述（齐肩层次剪、寸头、波波头）
+   - hairlineDetails: 发际线，用中文描述（自然发际线、美人尖、额角后退）
+
+【负面提示词】
+为角色生成negativePrompt，排除不符合设定的特征，用中文填写：
+- avoid: 要避免的特征（如中国人角色应避免 金色头发、蓝色眼睛）
+- styleExclusions: 风格排除（如 动漫风、卡通风、油画风）` : `【核心输出：6层身份锚点】
 这是AI生图中保持角色一致性的关键技术，必须详细填写：
 
 ① 骨相层（面部骨骼结构）
@@ -870,42 +1100,51 @@ ${background.characterBios?.slice(0, 1200) || '无'}
 【负面提示词】
 为角色生成negativePrompt，排除不符合设定的特征：
 - avoid: 要避免的特征（如中国人角色应避免 blonde hair, blue eyes）
-- styleExclusions: 风格排除（如 anime style, cartoon, painting）
+- styleExclusions: 风格排除（如 anime style, cartoon, painting）`}
 
 【服装要求】
-- 服装必须符合故事发生的年代（${background.storyStartYear || background.era || '现代'}）
-- 根据角色年龄设计合适的服装
-- 绝对不要设计成古装、汉服、或不符合时代的服饰
+- 服装必须严格符合故事设定的时代背景（${background.era || '现代'}）
+- 根据角色年龄和身份设计合适的服装
+- 绝对不要设计与剧本时代不符的服饰（如古装剧禁止现代服装，现代剧禁止古代服饰）
 
 请返回JSON格式（注意：只返回单个角色对象，不要数组包裹）：
 {
   "name": "角色名",
   "detailedDescription": "详细的中文角色描述（100-200字）",
-  "visualPromptEn": "English visual prompt, 40-60 words",
-  "visualPromptZh": "中文视觉提示词",
+${promptLanguage === 'zh' ? '  "visualPromptZh": "中文视觉提示词",' : promptLanguage === 'en' ? '  "visualPromptEn": "English visual prompt, 40-60 words",' : '  "visualPromptEn": "English visual prompt, 40-60 words",\n  "visualPromptZh": "中文视觉提示词",'}
   "clothingStyle": "符合年代的服装风格",
   "identityAnchors": {
-    "faceShape": "oval",
+${promptLanguage === 'zh' ? `    "faceShape": "长圆形",
+    "jawline": "柔和圆润，略带宽度",
+    "cheekbones": "不明显",
+    "eyeShape": "杏仁形，略下垂",
+    "eyeDetails": "双眼皮，眼神温和",
+    "noseShape": "高鼻梁，圆鼻头",
+    "lipShape": "丰唇",
+    "uniqueMarks": ["左眼下方小痣", "右脸颊酒窝"],` : `    "faceShape": "oval",
     "jawline": "soft rounded",
     "cheekbones": "subtle",
     "eyeShape": "almond",
     "eyeDetails": "double eyelids, warm gaze",
     "noseShape": "straight bridge, rounded tip",
     "lipShape": "full lips",
-    "uniqueMarks": ["small mole below left eye", "dimple on right cheek"],
+    "uniqueMarks": ["small mole below left eye", "dimple on right cheek"],`}
     "colorAnchors": {
       "iris": "#3D2314",
       "hair": "#1A1A1A",
       "skin": "#E8C4A0",
       "lips": "#C4727E"
     },
-    "skinTexture": "smooth with light smile lines",
+${promptLanguage === 'zh' ? `    "skinTexture": "皮肤光滑，有轻微笑纹",
+    "hairStyle": "短发整齐商务剪",
+    "hairlineDetails": "自然发际线"` : `    "skinTexture": "smooth with light smile lines",
     "hairStyle": "short neat business cut",
-    "hairlineDetails": "natural hairline"
+    "hairlineDetails": "natural hairline"`}
   },
   "negativePrompt": {
-    "avoid": ["blonde hair", "blue eyes", "beard", "tattoos"],
-    "styleExclusions": ["anime", "cartoon", "painting", "sketch"]
+${promptLanguage === 'zh' ? `    "avoid": ["金色头发", "蓝色眼睛", "胡须", "纹身"],
+    "styleExclusions": ["动漫风", "卡通风", "油画风", "素描风"]` : `    "avoid": ["blonde hair", "blue eyes", "beard", "tattoos"],
+    "styleExclusions": ["anime", "cartoon", "painting", "sketch"]`}
   }
 }`;
 
@@ -961,13 +1200,14 @@ ${c.name}（${c.importance === 'protagonist' ? '主角' : '重要配角'}）
       // 提取 identityAnchors
       const anchors = design.identityAnchors;
       
-      // 从新的 identityAnchors 中提取兼容字段
+      // 从新的 identityAnchors 中提取兼容字段（根据锚点值语言自动适配标签）
+      const isChinese = /[\u4e00-\u9fff]/.test(anchors?.faceShape || anchors?.eyeShape || '');
       const facialFeatures = anchors ? [
-        anchors.faceShape && `Face: ${anchors.faceShape}`,
-        anchors.eyeShape && `Eyes: ${anchors.eyeShape}`,
+        anchors.faceShape && (isChinese ? `脸型：${anchors.faceShape}` : `Face: ${anchors.faceShape}`),
+        anchors.eyeShape && (isChinese ? `眼型：${anchors.eyeShape}` : `Eyes: ${anchors.eyeShape}`),
         anchors.eyeDetails,
-        anchors.noseShape && `Nose: ${anchors.noseShape}`,
-        anchors.lipShape && `Lips: ${anchors.lipShape}`,
+        anchors.noseShape && (isChinese ? `鼻型：${anchors.noseShape}` : `Nose: ${anchors.noseShape}`),
+        anchors.lipShape && (isChinese ? `唇型：${anchors.lipShape}` : `Lips: ${anchors.lipShape}`),
       ].filter(Boolean).join(', ') : design.facialFeatures;
       
       // uniqueMarks 从 anchors.uniqueMarks 数组转换为字符串（向后兼容）

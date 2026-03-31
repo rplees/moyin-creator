@@ -10,7 +10,13 @@
  */
 
 import { useState, useMemo, useEffect, useCallback } from "react";
-import { useAPIConfigStore, type IProvider, type ImageHostProvider, type AIFeature } from "@/stores/api-config-store";
+import {
+  isVisibleImageHostProvider,
+  useAPIConfigStore,
+  type IProvider,
+  type ImageHostProvider,
+  type AIFeature,
+} from "@/stores/api-config-store";
 import { useAppSettingsStore } from "@/stores/app-settings-store";
 import { useProjectStore } from "@/stores/project-store";
 import { useCharacterLibraryStore } from "@/stores/character-library-store";
@@ -74,6 +80,9 @@ import {
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { uploadToImageHost } from "@/lib/image-host";
+import { UpdateDialog } from "@/components/UpdateDialog";
+import type { AvailableUpdateInfo } from "@/types/update";
+import packageJson from "../../../package.json";
 
 // Platform icon mapping
 const PLATFORM_ICONS: Record<string, React.ReactNode> = {
@@ -106,9 +115,11 @@ export function SettingsPanel() {
     resourceSharing,
     storagePaths,
     cacheSettings,
+    updateSettings,
     setResourceSharing,
     setStoragePaths,
     setCacheSettings,
+    setUpdateSettings,
   } = useAppSettingsStore();
   const { activeProjectId } = useProjectStore();
   const { assignProjectToUnscoped: assignCharactersToProject } = useCharacterLibraryStore();
@@ -129,6 +140,93 @@ export function SettingsPanel() {
   const [cacheSize, setCacheSize] = useState(0);
   const [isCacheLoading, setIsCacheLoading] = useState(false);
   const [isClearingCache, setIsClearingCache] = useState(false);
+  const [isCheckingForUpdates, setIsCheckingForUpdates] = useState(false);
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdateInfo | null>(null);
+  const [appVersion, setAppVersion] = useState(packageJson.version);
+  const visibleImageHostProviders = useMemo(
+    () => imageHostProviders.filter(isVisibleImageHostProvider),
+    [imageHostProviders],
+  );
+
+  // ====== Memefast 默认绑定自动补全 ======
+  // 覆盖场景：
+  //  1. 旧版本升级后已有 key 但 featureBindings 为空
+  //  2. 旧版本留下无效绑定（模型名错、provider ID 变更等）
+  //  3. 用户编辑填 key 后页面刷新
+  useEffect(() => {
+    const mf = providers.find(p => p.platform === 'memefast');
+    if (!mf || parseApiKeys(mf.apiKey).length === 0) return;
+
+    const pid = mf.id;
+    const models = mf.model || [];
+    const defaults: Record<string, string> = {
+      script_analysis: `${pid}:deepseek-v3.2`,
+      character_generation: `${pid}:gemini-3-pro-image-preview`,
+      video_generation: `${pid}:doubao-seedance-1-5-pro-251215`,
+      image_understanding: `${pid}:gemini-2.5-flash`,
+    };
+
+    // 检查绑定是否有效
+    const isBindingValid = (b: string): boolean => {
+      const idx = b.indexOf(':');
+      if (idx <= 0) return false;
+      const ref = b.slice(0, idx);
+      const model = b.slice(idx + 1);
+      const p = providers.find(pv => pv.id === ref || pv.platform === ref);
+      if (!p || parseApiKeys(p.apiKey).length === 0) return false;
+      // 模型列表为空时（尚未同步）暂时信任绑定
+      if (p.model.length === 0) return true;
+      return p.model.includes(model);
+    };
+
+    let changed = false;
+    for (const [feature, binding] of Object.entries(defaults)) {
+      const cur = getFeatureBindings(feature as AIFeature);
+
+      // 自愈：deepseek-v3 → deepseek-v3.2（在校验之前先迁移）
+      if (feature === 'script_analysis' && cur && cur.some(b => b.endsWith(':deepseek-v3'))) {
+        const migrated = cur.map(b => {
+          if (!b.endsWith(':deepseek-v3')) return b;
+          const i = b.indexOf(':');
+          return i > 0 ? `${b.slice(0, i)}:deepseek-v3.2` : binding;
+        });
+        setFeatureBindings(feature as AIFeature, [...new Set(migrated)]);
+        changed = true;
+        continue;
+      }
+
+      // 为空 或 全部无效 → 重新设置默认值
+      const needsDefault = !cur || cur.length === 0 || !cur.some(isBindingValid);
+      if (needsDefault) {
+        setFeatureBindings(feature as AIFeature, [binding]);
+        changed = true;
+      }
+    }
+    if (changed) {
+      console.log('[SettingsPanel] Auto-applied memefast default bindings');
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providers]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const version = await window.appUpdater?.getCurrentVersion?.();
+        if (!cancelled && version) {
+          setAppVersion(version);
+        }
+      } catch (error) {
+        console.warn("[SettingsPanel] Failed to load app version:", error);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Toggle provider expansion
   const toggleExpanded = (id: string) => {
@@ -163,7 +261,6 @@ export function SettingsPanel() {
       const testImage = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
       const result = await uploadToImageHost(testImage, {
         expiration: 60,
-        name: 'test',
         providerId: provider.id,
       });
       if (result.success) {
@@ -276,6 +373,7 @@ export function SettingsPanel() {
 
   const [activeTab, setActiveTab] = useState<string>("api");
   const hasStorageManager = typeof window !== "undefined" && !!window.storageManager;
+  const hasAppUpdater = typeof window !== "undefined" && !!window.appUpdater;
 
   const formatBytes = useCallback((bytes: number) => {
     if (!bytes) return "0 B";
@@ -358,7 +456,29 @@ export function SettingsPanel() {
     const result = await window.storageManager.moveData(dir);
     if (result.success) {
       setStoragePaths({ basePath: result.path || dir });
-      toast.success("存储位置已更新");
+      
+      // 清除 localStorage 中的缓存，确保从新路径加载数据
+      const keysToRemove = Object.keys(localStorage).filter(key => 
+        key.startsWith('moyin-') || key.includes('store')
+      );
+      keysToRemove.forEach(key => localStorage.removeItem(key));
+      
+      // 清除 IndexedDB 缓存
+      try {
+        const dbRequest = indexedDB.open('moyin-creator-db', 1);
+        dbRequest.onsuccess = () => {
+          const db = dbRequest.result;
+          if (db.objectStoreNames.contains('zustand-storage')) {
+            const tx = db.transaction('zustand-storage', 'readwrite');
+            tx.objectStore('zustand-storage').clear();
+          }
+        };
+      } catch (e) {
+        console.warn('Failed to clear IndexedDB:', e);
+      }
+      
+      toast.success("存储位置已更新，正在刷新...");
+      setTimeout(() => window.location.reload(), 500);
     } else {
       toast.error(`移动失败: ${result.error || "未知错误"}`);
     }
@@ -475,6 +595,41 @@ export function SettingsPanel() {
     } finally {
       setIsClearingCache(false);
     }
+  };
+
+  const handleCheckForUpdates = async () => {
+    if (!window.appUpdater) {
+      toast.error("请在桌面应用中使用此功能");
+      return;
+    }
+
+    setIsCheckingForUpdates(true);
+    try {
+      const result = await window.appUpdater.checkForUpdates();
+      if (!result.success) {
+        toast.error(`检查更新失败: ${result.error || "未知错误"}`);
+        return;
+      }
+
+      if (result.hasUpdate && result.update) {
+        setAvailableUpdate(result.update);
+        setUpdateDialogOpen(true);
+        return;
+      }
+
+      setAvailableUpdate(null);
+      toast.success(`当前已是最新版本 v${result.currentVersion}`);
+    } catch (error) {
+      console.error("[SettingsPanel] Failed to check updates:", error);
+      toast.error("检查更新失败，请稍后重试");
+    } finally {
+      setIsCheckingForUpdates(false);
+    }
+  };
+
+  const handleClearIgnoredVersion = () => {
+    setUpdateSettings({ ignoredVersion: "" });
+    toast.success("已恢复更新提醒");
   };
 
   return (
@@ -894,7 +1049,7 @@ export function SettingsPanel() {
               {/* About */}
               <div className="text-center py-8 text-muted-foreground border-t border-border">
                 <p className="text-sm font-medium">魔因漫创 Moyin Creator</p>
-                <p className="text-xs mt-1">v0.1.7 · AI 驱动的动漫视频创作工具</p>
+                <p className="text-xs mt-1">v{appVersion} · AI 驱动的动漫视频创作工具</p>
               </div>
             </div>
           </ScrollArea>
@@ -1040,7 +1195,7 @@ export function SettingsPanel() {
               {/* About */}
               <div className="text-center py-8 text-muted-foreground border-t border-border">
                 <p className="text-sm font-medium">魔因漫创 Moyin Creator</p>
-                <p className="text-xs mt-1">v0.1.7 · AI 驱动的动漫视频创作工具</p>
+                <p className="text-xs mt-1">v{appVersion} · AI 驱动的动漫视频创作工具</p>
               </div>
             </div>
           </ScrollArea>
@@ -1071,14 +1226,14 @@ export function SettingsPanel() {
                   </Button>
                 </div>
 
-                {imageHostProviders.length === 0 ? (
+                {visibleImageHostProviders.length === 0 ? (
                   <div className="text-sm text-muted-foreground">暂无图床配置</div>
                 ) : (
                   <div className="space-y-3">
-                    {imageHostProviders.map((provider) => {
+                    {visibleImageHostProviders.map((provider) => {
                       const keyCount = getApiKeyCount(provider.apiKey);
-                      const configured = provider.enabled && keyCount > 0;
                       const endpoint = provider.uploadPath || provider.baseUrl;
+                      const configured = provider.enabled && !!endpoint && (provider.apiKeyOptional || keyCount > 0);
                       return (
                         <div key={provider.id} className="p-4 border border-border rounded-xl bg-card space-y-3">
                           <div className="flex items-start justify-between gap-3">
@@ -1099,7 +1254,9 @@ export function SettingsPanel() {
                                 {provider.platform} · {endpoint || '未设置地址'}
                               </p>
                               <p className="text-xs text-muted-foreground">
-                                {keyCount} 个 Key
+                                {provider.apiKeyOptional && keyCount === 0
+                                  ? "游客上传（无需 Key）"
+                                  : `${keyCount} 个 Key`}
                               </p>
                             </div>
                             <div className="flex items-center gap-2">
@@ -1149,33 +1306,8 @@ export function SettingsPanel() {
                     启用多个图床会按顺序轮流使用，失败自动切换。
                   </p>
                   <p className="text-sm">
-                    👉 推荐使用免费图床{' '}
-                    <a
-                      href="https://imgbb.com/"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-blue-500 hover:text-blue-600 underline font-medium"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        window.open('https://imgbb.com/', '_blank');
-                      }}
-                    >
-                      ImgBB（点击前往注册）
-                    </a>
-                    ，注册后在{' '}
-                    <a
-                      href="https://api.imgbb.com/"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-blue-500 hover:text-blue-600 underline font-medium"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        window.open('https://api.imgbb.com/', '_blank');
-                      }}
-                    >
-                      API 页面
-                    </a>
-                    {' '}获取免费 API Key，然后点击上方「添加」按钮配置即可。
+                    默认已启用 SCDN 图床，不需要填写KEY；
+                    ImgBB 默认保持关闭，如需使用请手动开启并自行测试可用性。
                   </p>
                 </div>
               </div>
@@ -1183,7 +1315,7 @@ export function SettingsPanel() {
               {/* About */}
               <div className="text-center py-8 text-muted-foreground border-t border-border">
                 <p className="text-sm font-medium">魔因漫创 Moyin Creator</p>
-                <p className="text-xs mt-1">v0.1.7 · AI 驱动的动漫视频创作工具</p>
+                <p className="text-xs mt-1">v{appVersion} · AI 驱动的动漫视频创作工具</p>
               </div>
             </div>
           </ScrollArea>
@@ -1388,10 +1520,71 @@ export function SettingsPanel() {
                 </div>
               </div>
 
+              <div className="p-6 border border-border rounded-xl bg-card space-y-5">
+                <h4 className="font-medium text-foreground flex items-center gap-2">
+                  <Download className="h-4 w-4" />
+                  应用更新
+                </h4>
+
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium">当前版本</p>
+                    <p className="text-xs text-muted-foreground font-mono mt-1">v{appVersion}</p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleCheckForUpdates}
+                    disabled={!hasAppUpdater || isCheckingForUpdates}
+                  >
+                    {isCheckingForUpdates ? (
+                      <Loader2 className="h-4 w-4 animate-spin mr-1" />
+                    ) : (
+                      <RefreshCw className="h-4 w-4 mr-1" />
+                    )}
+                    检查更新
+                  </Button>
+                </div>
+
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium">启动时自动检查更新</p>
+                    <p className="text-xs text-muted-foreground">
+                      开启后，桌面版启动时会自动检查远程版本清单并提示新版本
+                    </p>
+                  </div>
+                  <Switch
+                    checked={updateSettings.autoCheckEnabled}
+                    onCheckedChange={(checked) => setUpdateSettings({ autoCheckEnabled: checked })}
+                    disabled={!hasAppUpdater}
+                  />
+                </div>
+
+                {updateSettings.ignoredVersion && (
+                  <div className="flex items-center justify-between gap-4 rounded-lg border border-border bg-muted/30 px-3 py-2">
+                    <div>
+                      <p className="text-sm font-medium">已忽略版本</p>
+                      <p className="text-xs text-muted-foreground font-mono mt-1">
+                        v{updateSettings.ignoredVersion}
+                      </p>
+                    </div>
+                    <Button variant="ghost" size="sm" onClick={handleClearIgnoredVersion}>
+                      恢复提醒
+                    </Button>
+                  </div>
+                )}
+
+                {!hasAppUpdater && (
+                  <p className="text-xs text-muted-foreground">
+                    此功能仅在桌面打包版中可用。
+                  </p>
+                )}
+              </div>
+
               {/* About */}
               <div className="text-center py-8 text-muted-foreground border-t border-border">
                 <p className="text-sm font-medium">魔因漫创 Moyin Creator</p>
-                <p className="text-xs mt-1">v0.1.7 · AI 驱动的动漫视频创作工具</p>
+                <p className="text-xs mt-1">v{appVersion} · AI 驱动的动漫视频创作工具</p>
               </div>
             </div>
           </ScrollArea>
@@ -1422,15 +1615,33 @@ export function SettingsPanel() {
             // 使用 provider.id（而非 platform 字符串）避免多供应商时的歧义解析
             const pid = provider.id;
             const MEMEFAST_DEFAULT_BINDINGS: Record<string, string> = {
-              script_analysis: `${pid}:deepseek-v3`,
+              // NOTE: MemeFast 端点已升级，旧的 deepseek-v3 已不在列表中，改用 deepseek-v3.2
+              script_analysis: `${pid}:deepseek-v3.2`,
               character_generation: `${pid}:gemini-3-pro-image-preview`,
               video_generation: `${pid}:doubao-seedance-1-5-pro-251215`,
               image_understanding: `${pid}:gemini-2.5-flash`,
             };
             for (const [feature, binding] of Object.entries(MEMEFAST_DEFAULT_BINDINGS)) {
               const current = getFeatureBindings(feature as AIFeature);
+              // 仅在未配置时设置默认值，避免覆盖用户手动选择
               if (!current || current.length === 0) {
                 setFeatureBindings(feature as AIFeature, [binding]);
+                continue;
+              }
+              // 自愈：旧默认 deepseek-v3 -> deepseek-v3.2（尽量不破坏多选配置）
+              if (feature === 'script_analysis') {
+                const hasOld = current.some((b) => b.endsWith(':deepseek-v3'));
+                if (hasOld) {
+                  const migrated = current.map((b) => {
+                    if (!b.endsWith(':deepseek-v3')) return b;
+                    const idx = b.indexOf(':');
+                    if (idx <= 0) return binding;
+                    const prefix = b.slice(0, idx);
+                    return `${prefix}:deepseek-v3.2`;
+                  });
+                  const deduped = Array.from(new Set(migrated));
+                  setFeatureBindings(feature as AIFeature, deduped);
+                }
               }
             }
           }
@@ -1457,6 +1668,41 @@ export function SettingsPanel() {
         provider={editingProvider}
         onSave={(provider) => {
           updateProvider(provider);
+
+          // 编辑 memefast 时也自动设置默认服务映射：初始状态会预置一个空 key 的 memefast，
+          // 用户通常是“编辑填 key”，如果不在这里补默认映射，会导致服务映射一直是 0/6。
+          if (provider.platform === 'memefast' && parseApiKeys(provider.apiKey).length > 0) {
+            const pid = provider.id;
+            const MEMEFAST_DEFAULT_BINDINGS: Record<string, string> = {
+              // NOTE: MemeFast 端点已升级，旧的 deepseek-v3 已不在列表中，改用 deepseek-v3.2
+              script_analysis: `${pid}:deepseek-v3.2`,
+              character_generation: `${pid}:gemini-3-pro-image-preview`,
+              video_generation: `${pid}:doubao-seedance-1-5-pro-251215`,
+              image_understanding: `${pid}:gemini-2.5-flash`,
+            };
+            for (const [feature, binding] of Object.entries(MEMEFAST_DEFAULT_BINDINGS)) {
+              const current = getFeatureBindings(feature as AIFeature);
+              if (!current || current.length === 0) {
+                setFeatureBindings(feature as AIFeature, [binding]);
+                continue;
+              }
+              // 自愈：旧默认 deepseek-v3 -> deepseek-v3.2
+              if (feature === 'script_analysis') {
+                const hasOld = current.some((b) => b.endsWith(':deepseek-v3'));
+                if (hasOld) {
+                  const migrated = current.map((b) => {
+                    if (!b.endsWith(':deepseek-v3')) return b;
+                    const idx = b.indexOf(':');
+                    if (idx <= 0) return binding;
+                    const prefix = b.slice(0, idx);
+                    return `${prefix}:deepseek-v3.2`;
+                  });
+                  const deduped = Array.from(new Set(migrated));
+                  setFeatureBindings(feature as AIFeature, deduped);
+                }
+              }
+            }
+          }
           // 编辑保存后自动同步模型列表和端点元数据
           if (parseApiKeys(provider.apiKey).length > 0) {
             setSyncingProvider(provider.id);
@@ -1483,6 +1729,15 @@ export function SettingsPanel() {
         onOpenChange={setImageHostEditOpen}
         provider={editingImageHost}
         onSave={updateImageHostProvider}
+      />
+      <UpdateDialog
+        open={updateDialogOpen}
+        onOpenChange={setUpdateDialogOpen}
+        updateInfo={availableUpdate}
+        onIgnoreVersion={(version) => {
+          setUpdateSettings({ ignoredVersion: version });
+          setAvailableUpdate(null);
+        }}
       />
     </div>
   );

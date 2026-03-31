@@ -328,7 +328,7 @@ export function buildVideoPrompt(
   }
 
   // ---------- Base Prompt: 用户视频提示词 ----------
-  const basePrompt = scene.videoPrompt || scene.videoPromptZh || '';
+  const basePrompt = scene.videoPromptZh || scene.videoPrompt || '';
   if (basePrompt.trim()) {
     promptParts.push(basePrompt.trim());
   }

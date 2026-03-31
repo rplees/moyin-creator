@@ -23,7 +23,8 @@ import {
   SHOT_SIZE_PRESETS,
   SOUND_EFFECT_PRESETS,
 } from "@/stores/director-store";
-import { useCharacterLibraryStore } from "@/stores/character-library-store";
+import { useCharacterLibraryStore, type Character, type CharacterVariation } from "@/stores/character-library-store";
+import { useScriptStore } from "@/stores/script-store";
 import { 
   ArrowLeft, 
   Trash2, 
@@ -35,6 +36,7 @@ import {
   Clapperboard,
   Film,
   Square,
+  Plus,
 } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useMediaStore } from "@/stores/media-store";
@@ -62,8 +64,9 @@ import { useAPIConfigStore } from "@/stores/api-config-store";
 import { parseApiKeys } from "@/lib/api-key-manager";
 import { getFeatureConfig, getFeatureNotConfiguredMessage } from "@/lib/ai/feature-router";
 import { submitGridImageRequest } from "@/lib/ai/image-generator";
+import { uploadToImageHost, isImageHostConfigured } from "@/lib/image-host";
 import { saveVideoToLocal, readImageAsBase64 } from '@/lib/image-storage';
-import { callVideoGenerationApi, isContentModerationError } from './use-video-generation';
+import { callVideoGenerationApi, extractLastFrameFromVideo, isContentModerationError } from './use-video-generation';
 import { persistSceneImage } from '@/lib/utils/image-persist';
 import {
   Select,
@@ -85,6 +88,7 @@ import {
   STYLE_CATEGORIES,
   getStyleById, 
   getStylePrompt,
+  getStyleNegativePrompt,
   getMediaType,
   DEFAULT_STYLE_ID 
 } from "@/lib/constants/visual-styles";
@@ -101,9 +105,186 @@ interface SplitScenesProps {
 // SceneCard 已移至 split-scene-card.tsx，此处使用 SplitSceneCard
 const SceneCard = SplitSceneCard;
 
+const isHttpImageUrl = (value?: string | null): boolean => {
+  return typeof value === 'string' && (value.startsWith('http://') || value.startsWith('https://'));
+};
+
+const isLocalImageSource = (value?: string | null): value is string => {
+  return typeof value === 'string' && value.length > 0 && !isHttpImageUrl(value);
+};
+
+const isDiscouragedExternalImageUrl = (value?: string | null): boolean => {
+  if (!isHttpImageUrl(value)) return false;
+  try {
+    const hostname = new URL(value ?? '').hostname.toLowerCase();
+    return hostname === 'bmp.ovh' || hostname.endsWith('.bmp.ovh');
+  } catch {
+    return false;
+  }
+};
+
+const shouldRefreshImageViaCurrentHost = (localUrl?: string | null): boolean => {
+  return isLocalImageSource(localUrl) && useAPIConfigStore.getState().isImageHostConfigured();
+};
+
+type ReferenceBucketKind = 'anchor' | 'character' | 'scene' | 'style';
+
+type ReferenceBucket = {
+  kind: ReferenceBucketKind;
+  images: string[];
+};
+
+type SceneCharacterContext = {
+  characterId: string;
+  name: string;
+  identityNotes: string[];
+  referenceImages: string[];
+};
+
+const MAX_REFERENCE_IMAGES = 14;
+const MAX_NANO_BANANA_REFERENCE_IMAGES = 6;
+const NANO_BANANA_IDENTITY_MODELS = new Set([
+  'nano-banana-pro',
+  'gemini-3-pro-image-preview',
+  'nano-banana-2',
+  'gemini-3.1-pro-image-preview',
+]);
+const REFERENCE_BUCKET_PRIORITY: Record<ReferenceBucketKind, number> = {
+  anchor: 0,
+  character: 1,
+  scene: 2,
+  style: 3,
+};
+
+const normalizeCharacterIdentityText = (value?: string | null, maxLength = 96): string => {
+  if (!value) return '';
+  const normalized = value
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s\-*•·]+/, '')
+    .replace(/[;,，；。]+$/g, '')
+    .trim();
+  if (!normalized) return '';
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trim()}...`;
+};
+
+const isNanoBananaProModel = (model?: string | null): boolean => {
+  const normalized = (model || '').trim().toLowerCase();
+  return NANO_BANANA_IDENTITY_MODELS.has(normalized);
+};
+
+const optimizeReferenceImagesForModel = (
+  model: string | undefined,
+  buckets: ReferenceBucket[],
+): string[] => {
+  const orderedBuckets = isNanoBananaProModel(model)
+    ? [...buckets].sort((left, right) => REFERENCE_BUCKET_PRIORITY[left.kind] - REFERENCE_BUCKET_PRIORITY[right.kind])
+    : buckets;
+  const limit = isNanoBananaProModel(model) ? MAX_NANO_BANANA_REFERENCE_IMAGES : MAX_REFERENCE_IMAGES;
+  const refs: string[] = [];
+  const seen = new Set<string>();
+
+  for (const bucket of orderedBuckets) {
+    for (const image of bucket.images) {
+      if (!image || seen.has(image)) continue;
+      seen.add(image);
+      refs.push(image);
+      if (refs.length >= limit) return refs;
+    }
+  }
+
+  return refs;
+};
+
+const buildReferencePriorityHint = (model: string | undefined, hasCharacterReferences: boolean): string => {
+  if (!isNanoBananaProModel(model) || !hasCharacterReferences) return '';
+  return [
+    'Reference priority:',
+    'the earliest character references are canonical identity anchors;',
+    'later references are only for scene, lighting, framing, and mood;',
+    'later references must never override face-name-body identity.',
+  ].join(' ');
+};
+
+const buildCharacterIdentityNotes = (
+  character: Character,
+  selectedVariation?: CharacterVariation,
+): string[] => {
+  const notes: string[] = [];
+  const push = (value?: string | null, maxLength = 96) => {
+    const normalized = normalizeCharacterIdentityText(value, maxLength);
+    if (!normalized || notes.includes(normalized)) return;
+    notes.push(normalized);
+  };
+
+  const anchors = character.identityAnchors;
+  if (anchors) {
+    const boneStructure = [anchors.faceShape, anchors.jawline, anchors.cheekbones].filter(Boolean).join(', ');
+    const facialFeatures = [anchors.eyeShape, anchors.eyeDetails, anchors.noseShape, anchors.lipShape].filter(Boolean).join(', ');
+    const hairDetails = [anchors.hairStyle, anchors.hairlineDetails].filter(Boolean).join(', ');
+    const colorDetails = [
+      anchors.colorAnchors?.iris ? `iris ${anchors.colorAnchors.iris}` : '',
+      anchors.colorAnchors?.hair ? `hair ${anchors.colorAnchors.hair}` : '',
+      anchors.colorAnchors?.skin ? `skin ${anchors.colorAnchors.skin}` : '',
+      anchors.colorAnchors?.lips ? `lips ${anchors.colorAnchors.lips}` : '',
+    ].filter(Boolean).join(', ');
+
+    if (boneStructure) push(`bone structure ${boneStructure}`);
+    if (facialFeatures) push(`facial features ${facialFeatures}`);
+    if (anchors.uniqueMarks?.length) push(`unique marks ${anchors.uniqueMarks.slice(0, 2).join(', ')}`);
+    if (hairDetails) push(`hair ${hairDetails}`);
+    if (colorDetails) push(`color anchors ${colorDetails}`);
+    if (anchors.skinTexture) push(`skin texture ${anchors.skinTexture}`);
+  }
+
+  if (notes.length < 4) push(character.appearance);
+  if (notes.length < 4) push(character.visualTraits);
+  if (notes.length < 4) push(character.description);
+  if (notes.length < 4) push(character.role);
+
+  if (selectedVariation) {
+    const variationPrompt = selectedVariation.visualPromptZh || selectedVariation.visualPrompt || selectedVariation.name;
+    push(`current outfit/state ${variationPrompt}`, 84);
+  }
+
+  return notes.slice(0, 4);
+};
+
+const buildCharacterIdentityBlock = (contexts: SceneCharacterContext[]): string => {
+  if (contexts.length === 0) return '';
+
+  const lines = ['Character identity lock:'];
+  contexts.forEach((context) => {
+    const summary = context.identityNotes.length > 0
+      ? context.identityNotes.join('; ')
+      : 'use the canonical earliest reference as the exact face/body identity anchor';
+    lines.push(`- ${context.name}: ${summary}.`);
+  });
+
+  if (contexts.length > 1) {
+    lines.push('Do not swap face identity, body identity, speaking ownership, or action ownership between named characters.');
+  } else {
+    lines.push('The named character must remain the exact same person in every output.');
+  }
+
+  return lines.join('\n');
+};
+
+const buildSceneCharacterCastLine = (contexts: SceneCharacterContext[]): string => {
+  if (contexts.length === 0) return '';
+
+  const names = contexts.map((context) => context.name).join(', ');
+  if (contexts.length === 1) {
+    return `Exact scene cast: ${names} only. Do not add any other person.`;
+  }
+
+  return `Exact scene cast: ${names}. Keep the face-name-body mapping exact for each named character and do not swap who performs or receives the action.`;
+};
+
 export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
   // ========== 合并生成（九宫格）本地 UI 状态 ==========
-  const [imageGenMode, setImageGenMode] = useState<'single' | 'merged'>('single');
+  const [imageGenMode, setImageGenMode] = useState<'single' | 'merged'>('merged');
   const [frameMode, setFrameMode] = useState<'first' | 'last' | 'both'>('first');
   const [isMergedRunning, setIsMergedRunning] = useState(false);
   const [refStrategy, setRefStrategy] = useState<'cluster'|'minimal'|'none'>('cluster');
@@ -111,6 +292,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
   const PAGE_CONCURRENCY = 2; // 每页并发集群数限制
   // 合并生成停止控制
   const mergedAbortRef = useRef(false);
+  // 首帧/视频/尾帧生成的 AbortController（用于真正取消底层 fetch 和轮询）
+  const imageAbortRef = useRef<AbortController | null>(null);
+  const videoAbortRef = useRef<AbortController | null>(null);
+  const endFrameAbortRef = useRef<AbortController | null>(null);
   // 合并生成控件将在 JSX 中内联渲染，避免闭包引用问题
   const [isGenerating, setIsGenerating] = useState(false);
   const [isGeneratingPrompts, setIsGeneratingPrompts] = useState(false);
@@ -138,7 +323,13 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
   // Get current project data
   const projectData = useActiveDirectorProject();
-  
+
+  // 获取当前项目的提示词语言设置（来自剧本面板）
+  const promptLanguage = useScriptStore(state => {
+    const pid = state.activeProjectId;
+    return pid ? state.projects[pid]?.promptLanguage : undefined;
+  }) || 'zh';
+
   // Read from project data (with defaults)
   const splitScenes = projectData?.splitScenes || [];
   const storyboardStatus = projectData?.storyboardStatus || 'idle';
@@ -199,6 +390,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     updateSplitSceneEndFrame,
     updateSplitSceneEndFrameStatus,
     updateSplitSceneCharacters,
+    updateSplitSceneCharacterVariationMap,
     updateSplitSceneEmotions,
     updateSplitSceneShotSize,
     updateSplitSceneDuration,
@@ -212,6 +404,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     // 视角切换历史
     addAngleSwitchHistory,
     deleteSplitScene,
+    addBlankSplitScene,
     resetStoryboard,
     // 预告片功能
     clearTrailer,
@@ -222,6 +415,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
   // Get current style from config
   // 优先使用直接存储的 visualStyleId，回退到 styleTokens 反推（兼容旧项目）
+  // 未设置时为 null（不施加任何风格），避免默认强制 2D 吉卜力
   const currentStyleId = useMemo(() => {
     if (storyboardConfig.visualStyleId) {
       return storyboardConfig.visualStyleId;
@@ -230,9 +424,9 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     if (storyboardConfig.styleTokens && storyboardConfig.styleTokens.length > 0) {
       const joinedTokens = storyboardConfig.styleTokens.join(', ');
       const found = VISUAL_STYLE_PRESETS.find(s => s.prompt.startsWith(joinedTokens));
-      return found?.id || DEFAULT_STYLE_ID;
+      return found?.id || null;
     }
-    return DEFAULT_STYLE_ID;
+    return null;
   }, [storyboardConfig.visualStyleId, storyboardConfig.styleTokens]);
 
   // 读取当前摄影风格档案（未设置时使用默认经典电影摄影风格）
@@ -311,7 +505,29 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
   // Handle update characters
   const handleUpdateCharacters = useCallback((sceneId: number, characterIds: string[]) => {
     updateSplitSceneCharacters(sceneId, characterIds);
-  }, [updateSplitSceneCharacters]);
+    const currentScene = splitScenes.find((s) => s.id === sceneId);
+    const currentMap = currentScene?.characterVariationMap;
+    if (!currentMap) return;
+
+    const selectedSet = new Set(characterIds);
+    const prunedMap: Record<string, string> = {};
+    Object.entries(currentMap).forEach(([charId, variationId]) => {
+      if (selectedSet.has(charId) && variationId) {
+        prunedMap[charId] = variationId;
+      }
+    });
+
+    const hasChanged =
+      Object.keys(prunedMap).length !== Object.keys(currentMap).length ||
+      Object.entries(prunedMap).some(([charId, variationId]) => currentMap[charId] !== variationId);
+    if (hasChanged) {
+      updateSplitSceneCharacterVariationMap(sceneId, prunedMap);
+    }
+  }, [splitScenes, updateSplitSceneCharacters, updateSplitSceneCharacterVariationMap]);
+
+  const handleUpdateCharacterVariationMap = useCallback((sceneId: number, characterVariationMap: Record<string, string>) => {
+    updateSplitSceneCharacterVariationMap(sceneId, characterVariationMap);
+  }, [updateSplitSceneCharacterVariationMap]);
 
   // Handle update emotions
   const handleUpdateEmotions = useCallback((sceneId: number, emotionTags: EmotionTag[]) => {
@@ -386,8 +602,6 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     setIsExtractingFrame(true);
     
     try {
-      const { extractLastFrameFromVideo } = await import('./use-video-generation');
-      
       // 提取最后一帧
       const lastFrameBase64 = await extractLastFrameFromVideo(scene.videoUrl, 0.1);
       if (!lastFrameBase64) {
@@ -413,6 +627,8 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
   // ========== 停止生成处理函数 ==========
   // 停止首帧图片生成
   const handleStopImageGeneration = useCallback((sceneId: number) => {
+    imageAbortRef.current?.abort();
+    imageAbortRef.current = null;
     updateSplitSceneImageStatus(sceneId, {
       imageStatus: 'idle',
       imageProgress: 0,
@@ -425,6 +641,8 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
   // 停止视频生成
   const handleStopVideoGeneration = useCallback((sceneId: number) => {
+    videoAbortRef.current?.abort();
+    videoAbortRef.current = null;
     updateSplitSceneVideo(sceneId, {
       videoStatus: 'idle',
       videoProgress: 0,
@@ -437,6 +655,8 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
   // 停止尾帧图片生成
   const handleStopEndFrameGeneration = useCallback((sceneId: number) => {
+    endFrameAbortRef.current?.abort();
+    endFrameAbortRef.current = null;
     updateSplitSceneEndFrameStatus(sceneId, {
       endFrameStatus: 'idle',
       endFrameProgress: 0,
@@ -531,9 +751,11 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       };
       addAngleSwitchHistory(angleSwitchTarget.sceneId, angleSwitchTarget.type, newHistoryItem);
 
-      // 获取更新后的历史（从 scene 中读取）
-      const updatedScene = splitScenes.find(s => s.id === angleSwitchTarget.sceneId);
-      const history = angleSwitchTarget.type === "start" 
+      // 从 store 实时读取最新状态，避免闭包中 splitScenes 尚未更新导致索引偏差
+      const { activeProjectId, projects } = useDirectorStore.getState();
+      const latestScenes = activeProjectId ? (projects[activeProjectId]?.splitScenes || []) : [];
+      const updatedScene = latestScenes.find(s => s.id === angleSwitchTarget.sceneId);
+      const history = angleSwitchTarget.type === "start"
         ? (updatedScene?.startFrameAngleSwitchHistory || [])
         : (updatedScene?.endFrameAngleSwitchHistory || []);
       setSelectedHistoryIndex(history.length - 1); // 选中最新的
@@ -560,29 +782,152 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     return buildEmotionDesc(emotionTags);
   }, []);
 
-  // 收集角色参考图片 - 必须在 handleQuadGridGenerate 之前定义
-  const getCharacterReferenceImages = useCallback((characterIds: string[]): string[] => {
+  const getSceneCharacterContexts = useCallback((
+    characterIds: string[],
+    variationMap?: Record<string, string>,
+  ): SceneCharacterContext[] => {
+    if (!characterIds?.length) return [];
+
     const { characters } = useCharacterLibraryStore.getState();
+
+    return characterIds.flatMap((characterId) => {
+      const character = characters.find((item) => item.id === characterId);
+      if (!character) return [];
+
+      const variationId = variationMap?.[characterId];
+      const selectedVariation = variationId
+        ? character.variations?.find((variation) => variation.id === variationId)
+        : undefined;
+
+      const referenceImages: string[] = [];
+      const seen = new Set<string>();
+      const pushRef = (value?: string | null) => {
+        if (!value || seen.has(value)) return;
+        seen.add(value);
+        referenceImages.push(value);
+      };
+
+      pushRef(character.thumbnailUrl);
+      pushRef(selectedVariation?.referenceImage);
+
+      for (const view of character.views || []) {
+        pushRef(view.imageBase64 || view.imageUrl);
+      }
+
+      for (const image of character.referenceImages || []) {
+        pushRef(image);
+      }
+
+      for (const image of selectedVariation?.clothingReferenceImages || []) {
+        pushRef(image);
+      }
+
+      return [{
+        characterId,
+        name: character.name || 'Unnamed character',
+        identityNotes: buildCharacterIdentityNotes(character, selectedVariation),
+        referenceImages: referenceImages.slice(0, MAX_REFERENCE_IMAGES),
+      }];
+    });
+  }, []);
+
+  // 收集角色参考图片 - 必须在 handleQuadGridGenerate 之前定义
+  const getCharacterReferenceImages = useCallback((
+    characterIds: string[],
+    variationMap?: Record<string, string>,
+  ): string[] => {
+    const contexts = getSceneCharacterContexts(characterIds, variationMap);
+    if (contexts.length === 0) return [];
+
     const refs: string[] = [];
-    
-    for (const charId of characterIds) {
-      const char = characters.find(c => c.id === charId);
-      if (char) {
-        // 取角色的第一张视图图片作为参考
-        const view = char.views[0];
-        if (view) {
-          // 优先使用 base64（持久化），其次使用 URL
-          const imageRef = view.imageBase64 || view.imageUrl;
-          if (imageRef) {
-            refs.push(imageRef);
-          }
+    const seen = new Set<string>();
+
+    const maxDepth = contexts.reduce((depth, context) => Math.max(depth, context.referenceImages.length), 0);
+
+    for (let index = 0; index < maxDepth; index += 1) {
+      for (const context of contexts) {
+        const image = context.referenceImages[index];
+        if (!image || seen.has(image)) continue;
+        seen.add(image);
+        refs.push(image);
+        if (refs.length >= MAX_REFERENCE_IMAGES) {
+          return refs;
         }
       }
     }
-    
-    return refs;
-  }, []);
 
+    return refs.slice(0, MAX_REFERENCE_IMAGES);
+  }, [getSceneCharacterContexts]);
+
+  const getSceneIdentityLockLines = useCallback((
+    scene: SplitScene,
+    model?: string,
+    hasCharacterRefs?: boolean,
+  ): string[] => {
+    const contexts = getSceneCharacterContexts(scene.characterIds || [], scene.characterVariationMap);
+    if (contexts.length === 0) return [];
+
+    const lines: string[] = [];
+    const castLine = buildSceneCharacterCastLine(contexts);
+    const resolvedHasCharacterRefs = hasCharacterRefs ?? contexts.some((context) => context.referenceImages.length > 0);
+
+    if (castLine) {
+      lines.push(castLine);
+    }
+
+    const identityBlock = buildCharacterIdentityBlock(contexts);
+    if (identityBlock) {
+      lines.push(...identityBlock.split('\n'));
+    }
+
+    const priorityHint = buildReferencePriorityHint(model, resolvedHasCharacterRefs);
+    if (priorityHint) {
+      lines.push(priorityHint);
+    }
+
+    return lines;
+  }, [getSceneCharacterContexts]);
+
+  const buildPromptWithIdentityLock = useCallback((
+    basePrompt: string,
+    scene: SplitScene,
+    model?: string,
+    hasCharacterRefs?: boolean,
+  ): string => {
+    const prompt = basePrompt.trim();
+    const identityLines = getSceneIdentityLockLines(scene, model, hasCharacterRefs);
+    if (identityLines.length === 0) return prompt;
+
+    return [prompt, identityLines.join('\n')].filter(Boolean).join('\n\n');
+  }, [getSceneIdentityLockLines]);
+
+  const processReferenceImagesForApi = useCallback(async (
+    referenceImages: string[],
+    logPrefix: string,
+  ): Promise<string[]> => {
+    const processedRefs: string[] = [];
+
+    for (const url of referenceImages) {
+      if (!url) continue;
+
+      if (url.startsWith('http://') || url.startsWith('https://')) {
+        processedRefs.push(url);
+      } else if (url.startsWith('data:image/') && url.includes(';base64,')) {
+        processedRefs.push(url);
+      } else if (url.startsWith('local-image://')) {
+        try {
+          const base64 = await readImageAsBase64(url);
+          if (base64 && base64.startsWith('data:image/') && base64.includes(';base64,')) {
+            processedRefs.push(base64);
+          }
+        } catch (error) {
+          console.warn(`${logPrefix} Failed to read local image:`, url, error);
+        }
+      }
+    }
+
+    return processedRefs;
+  }, []);
   // Handle quad grid click
   const handleQuadGridClick = useCallback((sceneId: number, type: "start" | "end") => {
     const scene = splitScenes.find(s => s.id === sceneId);
@@ -623,7 +968,13 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       return;
     }
     
-    const apiKey = featureConfig.apiKey;
+    const keyManager = featureConfig.keyManager;
+    const apiKey = keyManager.getCurrentKey() || '';
+    if (!apiKey) {
+      toast.error('请先在设置中配置图片生成服务映射');
+      setQuadGridOpen(false);
+      return;
+    }
     const platform = featureConfig.platform;
     const model = featureConfig.models?.[0];
     if (!model) {
@@ -662,6 +1013,11 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       const basePrompt = scene.imagePromptZh?.trim() || scene.imagePrompt?.trim() || scene.videoPromptZh?.trim() || scene.videoPrompt?.trim() || '';
       const styleTokens = storyboardConfig.styleTokens || [];
       const aspect = storyboardConfig.aspectRatio || '9:16';
+      const sceneCharacterContexts = getSceneCharacterContexts(scene.characterIds || [], scene.characterVariationMap);
+      const sceneCharacterRefs = useCharacterRef
+        ? getCharacterReferenceImages(scene.characterIds || [], scene.characterVariationMap)
+        : [];
+      const hasCharacterRefs = sceneCharacterContexts.some((context) => context.referenceImages.length > 0);
 
       // === 人物数量约束 ===
       const charCount = scene.characterIds?.length || 0;
@@ -722,14 +1078,21 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       gridPromptParts.push('Keep lighting and color grading consistent across all 4 panels.');
       gridPromptParts.push('IMPORTANT: NO TEXT, NO WORDS, NO LETTERS, NO CAPTIONS, NO SPEECH BUBBLES, NO DIALOGUE BOXES, NO SUBTITLES, NO WRITING of any kind in any panel.');
 
-      const gridPrompt = gridPromptParts.join(' ');
+      const gridPrompt = buildPromptWithIdentityLock(gridPromptParts.join(' '), scene, model, hasCharacterRefs);
       console.log('[QuadGrid] Grid prompt:', gridPrompt.substring(0, 200) + '...');
+
+      const optimizedRefs = optimizeReferenceImagesForModel(model, [
+        { kind: 'anchor', images: [sourceImage] },
+        { kind: 'character', images: sceneCharacterRefs },
+        { kind: 'scene', images: scene.sceneReferenceImage ? [scene.sceneReferenceImage] : [] },
+      ]);
+      const apiReferenceImages = await processReferenceImagesForApi(optimizedRefs, '[QuadGrid]');
 
       // Collect reference images
       const refs: string[] = [sourceImage];
       // 只有在勾选了"参考角色库形象"时，才添加角色参考图
       if (useCharacterRef && scene.characterIds?.length) {
-        refs.push(...getCharacterReferenceImages(scene.characterIds));
+        refs.push(...getCharacterReferenceImages(scene.characterIds, scene.characterVariationMap));
       }
       if (scene.sceneReferenceImage) {
         refs.push(scene.sceneReferenceImage);
@@ -737,7 +1100,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
       // Process refs for API
       const processedRefs: string[] = [];
-      for (const url of refs.slice(0, 4)) {
+      for (const url of refs.slice(0, 14)) {
         if (!url) continue;
         if (url.startsWith('http://') || url.startsWith('https://')) {
           processedRefs.push(url);
@@ -770,7 +1133,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         baseUrl: imageBaseUrl,
         aspectRatio: aspect,
         resolution: storyboardConfig.resolution || '2K',
-        referenceImages: processedRefs.length > 0 ? processedRefs : undefined,
+        referenceImages: apiReferenceImages.length > 0
+          ? apiReferenceImages
+          : (processedRefs.length > 0 ? processedRefs : undefined),
+        keyManager,
       });
 
       let gridImageUrl = apiResult.imageUrl;
@@ -879,7 +1245,19 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     } finally {
       setIsQuadGridGenerating(false);
     }
-  }, [quadGridTarget, splitScenes, storyboardConfig, getApiKey, getCharacterReferenceImages]);
+  }, [
+    quadGridTarget,
+    splitScenes,
+    storyboardConfig,
+    buildEmotionDescription,
+    getSceneCharacterContexts,
+    getCharacterReferenceImages,
+    buildPromptWithIdentityLock,
+    processReferenceImagesForApi,
+    getImageFolderId,
+    addMediaFromUrl,
+    mediaProjectId,
+  ]);
 
   // Apply quad grid result
   const handleApplyQuadGrid = useCallback(async (imageIndex: number) => {
@@ -1027,7 +1405,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
           dialogue: s.dialogue,
           // Additional fields for text-based generation
           sceneName: s.sceneName,
-          sceneDescription: s.sceneDescription,
+          sceneDescription: s.sceneLocation,
         })),
         apiKey,
         provider: provider as any,
@@ -1133,6 +1511,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     setIsGenerating(true);
     setCurrentGeneratingId(sceneId);
 
+    // 创建本次视频生成的 AbortController，停止按钮可通过 videoAbortRef.current.abort() 取消
+    const videoController = new AbortController();
+    videoAbortRef.current = videoController;
+
     try {
       // Reset and start
       updateSplitSceneVideo(sceneId, {
@@ -1143,30 +1525,33 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       });
 
       // 首帧图片选择逻辑：
-      // 1. 优先使用 imageDataUrl（用户最新选择/上传的图片）
-      // 2. 只有当 imageSource === 'ai-generated' 且 imageHttpUrl 是有效 URL 时才使用 imageHttpUrl
-      // 3. 否则使用 imageDataUrl 并通过图床上传转换为 HTTP URL
-      // 关键：合并生成的图片没有 imageHttpUrl（被清除为 null），必须重新上传
-      let firstFrameUrl = scene.imageDataUrl;
-      
-      // 检查 imageHttpUrl 是否是有效的 HTTP URL（非 null、非 undefined、非空字符串）
-      const hasValidHttpUrl = scene.imageHttpUrl && 
-                              typeof scene.imageHttpUrl === 'string' && 
-                              scene.imageHttpUrl.startsWith('http');
-      
-      // 如果 imageDataUrl 不是 HTTP URL，检查是否有对应的 imageHttpUrl
-      if (firstFrameUrl && !firstFrameUrl.startsWith('http://') && !firstFrameUrl.startsWith('https://')) {
-        // imageDataUrl 是本地格式（base64 或 local-image://）
-        if (hasValidHttpUrl && scene.imageSource === 'ai-generated') {
-          // 只有当 imageSource 明确标记为 'ai-generated' 且有有效的 HTTP URL 时才使用
-          // 这意味着这是单张 AI 生成的图片，不是合并生成切割的图片
+      // 1. 如果本地持久化图片存在且已配置图床，始终优先使用本地图重新上传到当前图床
+      // 2. 否则仅在 imageSource === 'ai-generated' 且已有可用 HTTP URL 时复用该 URL
+      // 3. 其余情况使用 imageDataUrl，并在后续转换为 HTTP URL
+      let firstFrameUrl = scene.imageDataUrl || (isHttpImageUrl(scene.imageHttpUrl) ? scene.imageHttpUrl : '');
+      const hasValidHttpUrl = isHttpImageUrl(scene.imageHttpUrl);
+      const shouldRefreshFirstFrame = shouldRefreshImageViaCurrentHost(scene.imageDataUrl);
+
+      if (isLocalImageSource(scene.imageDataUrl)) {
+        if (shouldRefreshFirstFrame) {
+          if (hasValidHttpUrl) {
+            console.log(
+              `[SplitScenes] Using local first frame and refreshing via configured image host${isDiscouragedExternalImageUrl(scene.imageHttpUrl) ? ' (skipping discouraged external URL)' : ''}:`,
+              scene.imageHttpUrl!.substring(0, 60)
+            );
+          } else {
+            console.log('[SplitScenes] Using local first frame and uploading to configured image host');
+          }
+          firstFrameUrl = scene.imageDataUrl;
+        } else if (hasValidHttpUrl && scene.imageSource === 'ai-generated') {
+          // 没有可用图床时，才回退到已有的 HTTP URL
           console.log('[SplitScenes] Using imageHttpUrl for AI-generated image:', scene.imageHttpUrl!.substring(0, 60));
           firstFrameUrl = scene.imageHttpUrl!;
         } else {
-          // 否则使用 imageDataUrl（合并生成切割的图片、素材库选择的图片等）
-          // 将通过图床上传转换为 HTTP URL
-          console.log('[SplitScenes] Using imageDataUrl (will upload to image host):', 
-            hasValidHttpUrl ? 'has old httpUrl but imageSource=' + scene.imageSource : 'no valid httpUrl');
+          console.log(
+            '[SplitScenes] Using imageDataUrl (will upload to image host):',
+            hasValidHttpUrl ? 'has old httpUrl but imageSource=' + scene.imageSource : 'no valid httpUrl'
+          );
         }
       }
       
@@ -1181,18 +1566,24 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       // 仅当 needsEndFrame 为 true 时才使用尾帧
       // 如果用户已删除尾帧或关闭了尾帧开关，则不使用尾帧作为视频生成的参考
       let lastFrameUrl: string | null | undefined = null;
-      if (scene.needsEndFrame && scene.endFrameImageUrl) {
-        // 优先使用 endFrameHttpUrl（原始 HTTP URL）
-        // 如果没有，尝试使用 endFrameImageUrl（可能需要上传图床）
-        lastFrameUrl = scene.endFrameHttpUrl || scene.endFrameImageUrl;
-        console.log('[SplitScenes] Using end frame for video generation');
+      if (scene.needsEndFrame && (scene.endFrameImageUrl || scene.endFrameHttpUrl)) {
+        const shouldRefreshEndFrame = shouldRefreshImageViaCurrentHost(scene.endFrameImageUrl);
+        if (shouldRefreshEndFrame && scene.endFrameImageUrl) {
+          lastFrameUrl = scene.endFrameImageUrl;
+          console.log(
+            `[SplitScenes] Using local end frame and refreshing via configured image host${isDiscouragedExternalImageUrl(scene.endFrameHttpUrl) ? ' (skipping discouraged external URL)' : ''}`
+          );
+        } else {
+          lastFrameUrl = scene.endFrameImageUrl || scene.endFrameHttpUrl;
+          console.log('[SplitScenes] Using end frame for video generation');
+        }
       } else {
         console.log('[SplitScenes] Skipping end frame: needsEndFrame=', scene.needsEndFrame, 'hasEndFrame=', !!scene.endFrameImageUrl);
       }
 
       // Collect character reference images
       const characterRefs = scene.characterIds?.length 
-        ? getCharacterReferenceImages(scene.characterIds)
+        ? getCharacterReferenceImages(scene.characterIds, scene.characterVariationMap)
         : [];
 
       updateSplitSceneVideo(sceneId, {
@@ -1244,27 +1635,41 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
       // Convert local/base64 image to HTTP URL for API
       // Video API requires HTTP URLs, not base64
-      const convertToHttpUrl = async (rawUrl: any): Promise<string> => {
+      const convertToHttpUrl = async (
+        rawUrl: any,
+        options?: { localFallback?: string | null; frameLabel?: string }
+      ): Promise<string> => {
         const url = normalizeUrl(rawUrl);
+        const localFallback = normalizeUrl(options?.localFallback);
+        const frameLabel = options?.frameLabel || 'Frame';
         if (!url) {
           console.warn('[SplitScenes] convertToHttpUrl received invalid url:', rawUrl);
           return '';
         }
         
         // Already HTTP URL - use directly
-        if (url.startsWith('http://') || url.startsWith('https://')) {
-          console.log('[SplitScenes] Using existing HTTP URL:', url.substring(0, 60));
+        if (isHttpImageUrl(url)) {
+          if (shouldRefreshImageViaCurrentHost(localFallback)) {
+            console.log(
+              `[SplitScenes] ${frameLabel}: refreshing via configured image host instead of reusing existing HTTP URL${isDiscouragedExternalImageUrl(url) ? ' (discouraged external host)' : ''}:`,
+              url.substring(0, 60)
+            );
+            return convertToHttpUrl(localFallback, { frameLabel });
+          }
+          if (isDiscouragedExternalImageUrl(url)) {
+            console.warn(`[SplitScenes] ${frameLabel}: using discouraged external URL because no local fallback is available:`, url.substring(0, 60));
+          } else {
+            console.log('[SplitScenes] Using existing HTTP URL:', url.substring(0, 60));
+          }
           return url;
         }
         
         // For base64 or local images, we need to upload to image host
         try {
-          const { uploadToImageHost, isImageHostConfigured } = await import('@/lib/image-host');
-          
           // Check if image host is configured
           if (!isImageHostConfigured()) {
-            console.warn('[SplitScenes] Image host not configured. Please configure imgbb API key in settings.');
-            throw new Error('图床未配置，请在设置中配置 imgbb API Key');
+            console.warn('[SplitScenes] Image host not configured. Please configure an image host in settings.');
+            throw new Error('图床未配置，请先在设置中启用 Catbox 或其他可用图床');
           }
           
           let imageData = url;
@@ -1310,7 +1715,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       const normalizedFirstFrame = normalizeUrl(firstFrameUrl);
       console.log('[SplitScenes] First frame URL (normalized):', normalizedFirstFrame?.substring(0, 80));
       
-      const firstFrameConverted = await convertToHttpUrl(normalizedFirstFrame);
+      const firstFrameConverted = await convertToHttpUrl(normalizedFirstFrame, {
+        localFallback: scene.imageDataUrl,
+        frameLabel: 'First frame',
+      });
       if (!firstFrameConverted) {
         throw new Error('无法获取首帧图片的 HTTP URL，请重新生成图片');
       }
@@ -1319,7 +1727,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
       // Last frame (optional)
       if (lastFrameUrl) {
-        const lastFrameConverted = await convertToHttpUrl(lastFrameUrl);
+        const lastFrameConverted = await convertToHttpUrl(lastFrameUrl, {
+          localFallback: scene.endFrameImageUrl,
+          frameLabel: 'Last frame',
+        });
         if (lastFrameConverted) {
           imageWithRoles.push({ url: lastFrameConverted, role: 'last_frame' });
           console.log('[SplitScenes] Last frame HTTP URL:', lastFrameConverted.substring(0, 60));
@@ -1348,6 +1759,11 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         keyManager,
         platform,
         storyboardConfig.videoResolution as '480p' | '720p' | '1080p' | undefined,
+        undefined,  // videoRefs
+        undefined,  // audioRefs
+        undefined,  // enableAudio
+        undefined,  // cameraFixed
+        videoController.signal,
       );
 
       // Save video to local file system (Electron) for persistence
@@ -1377,8 +1793,6 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       if (shouldExtractEndFrame) {
         (async () => {
           try {
-            const { extractLastFrameFromVideo } = await import('./use-video-generation');
-            
             const lastFrameBase64 = await extractLastFrameFromVideo(finalVideoUrl, 0.1);
             if (!lastFrameBase64) {
               console.warn('[SplitScenes] Failed to extract last frame from video');
@@ -1402,8 +1816,17 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
     } catch (error) {
       const err = error as Error;
+
+      // 用户主动取消：abort() 触发的 AbortError 或自定义 '用户已取消'
+      if (err.name === 'AbortError' || err.message === '用户已取消') {
+        console.log(`[SplitScenes] Scene ${sceneId} video generation cancelled by user`);
+        setIsGenerating(false);
+        setCurrentGeneratingId(null);
+        return;
+      }
+
       console.error(`[SplitScenes] Scene ${sceneId} video generation failed:`, err);
-      
+
       // 检测是否为内容审核错误
       const isModerationError = isContentModerationError(err);
       
@@ -1446,7 +1869,9 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     }
 
     // Check if all scenes have prompts
-    const scenesWithoutPrompts = splitScenes.filter(s => !s.videoPrompt.trim());
+    const scenesWithoutPrompts = splitScenes.filter(
+      s => !(s.videoPromptZh?.trim() || s.videoPrompt?.trim())
+    );
     if (scenesWithoutPrompts.length > 0) {
       toast.warning(`还有 ${scenesWithoutPrompts.length} 个分镜没有提示词，将使用默认提示词`);
     }
@@ -1505,7 +1930,12 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       return;
     }
     
-    const apiKey = featureConfig.apiKey;
+    const keyManager = featureConfig.keyManager;
+    const apiKey = keyManager.getCurrentKey() || '';
+    if (!apiKey) {
+      toast.error('请先在设置中配置图片生成服务映射');
+      return;
+    }
     const platform = featureConfig.platform;
     const model = featureConfig.models?.[0];
     if (!model) {
@@ -1530,6 +1960,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     }
 
     setIsGenerating(true);
+    // 创建本次生成的 AbortController，停止按钮可通过 imageAbortRef.current.abort() 取消
+    const imageController = new AbortController();
+    imageAbortRef.current = imageController;
+    const imageSignal = imageController.signal;
 
     try {
       // Update status
@@ -1545,6 +1979,13 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       if (fullStylePrompt) {
         enhancedPrompt = `${promptToUse}. Style: ${fullStylePrompt}`;
       }
+      const sceneCharacterContexts = getSceneCharacterContexts(scene.characterIds || [], scene.characterVariationMap);
+      const sceneCharacterRefs = getCharacterReferenceImages(scene.characterIds || [], scene.characterVariationMap);
+      const fallbackCharacterRefs = sceneCharacterContexts.length === 0
+        ? (storyboardConfig.characterReferenceImages || [])
+        : [];
+      const hasCharacterRefs = sceneCharacterRefs.length > 0;
+      enhancedPrompt = buildPromptWithIdentityLock(enhancedPrompt, scene, model, hasCharacterRefs);
 
       // Collect reference images: scene background > characters > storyboard style
       const referenceImages: string[] = [];
@@ -1557,7 +1998,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       
       // 2. 添加角色参考图
       if (scene.characterIds && scene.characterIds.length > 0) {
-        const sceneCharRefs = getCharacterReferenceImages(scene.characterIds);
+        const sceneCharRefs = getCharacterReferenceImages(scene.characterIds, scene.characterVariationMap);
         referenceImages.push(...sceneCharRefs);
       } else if (storyboardConfig.characterReferenceImages && storyboardConfig.characterReferenceImages.length > 0) {
         // Fallback to storyboardConfig characters
@@ -1569,10 +2010,17 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         referenceImages.push(storyboardImage);
       }
 
+      const optimizedReferenceImages = optimizeReferenceImagesForModel(model, [
+        { kind: 'scene', images: scene.sceneReferenceImage ? [scene.sceneReferenceImage] : [] },
+        { kind: 'character', images: sceneCharacterRefs.length > 0 ? sceneCharacterRefs : fallbackCharacterRefs },
+        { kind: 'style', images: storyboardImage ? [storyboardImage] : [] },
+      ]);
+      const apiReferenceImages = await processReferenceImagesForApi(optimizedReferenceImages, '[SingleImage]');
+
       console.log('[SplitScenes] Generating image:', {
         sceneId,
         prompt: enhancedPrompt.substring(0, 100),
-        characterRefCount: referenceImages.length,
+        characterRefCount: optimizedReferenceImages.length,
         platform,
         model,
         imageBaseUrl,
@@ -1581,7 +2029,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       // Collect reference images for API
       // Supports: HTTP URLs, base64 Data URI, local-image:// (converted to base64)
       const processedRefs: string[] = [];
-      for (const url of referenceImages.slice(0, 4)) {
+      for (const url of referenceImages.slice(0, 14)) {
         if (!url) continue;
         if (url.startsWith('http://') || url.startsWith('https://')) {
           processedRefs.push(url);
@@ -1605,7 +2053,11 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         baseUrl: imageBaseUrl,
         aspectRatio: storyboardConfig.aspectRatio || '9:16',
         resolution: storyboardConfig.resolution || '2K',
-        referenceImages: processedRefs.length > 0 ? processedRefs : undefined,
+        referenceImages: apiReferenceImages.length > 0
+          ? apiReferenceImages
+          : (processedRefs.length > 0 ? processedRefs : undefined),
+        keyManager,
+        signal: imageSignal,
       });
 
       // Helper to normalize URL (handle array format) - used in poll responses
@@ -1619,7 +2071,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       // Direct URL result
       if (apiResult.imageUrl) {
         const persistResult = await persistSceneImage(apiResult.imageUrl, sceneId, 'first');
-        updateSplitSceneImage(sceneId, persistResult.localPath, scene.width, scene.height, persistResult.httpUrl || apiResult.imageUrl);
+        updateSplitSceneImage(sceneId, persistResult.localPath, scene.width, scene.height, persistResult.httpUrl || undefined);
         autoSaveImageToLibrary(sceneId, persistResult.localPath);
         toast.success(`分镜 ${sceneId + 1} 图片生成完成，已保存到素材库`);
         setIsGenerating(false);
@@ -1648,6 +2100,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
               'Authorization': `Bearer ${apiKey}`,
               'Cache-Control': 'no-cache',
             },
+            signal: imageSignal,
           });
 
           if (!statusResponse.ok) {
@@ -1674,7 +2127,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
             
             // 持久化到本地 + 图床
             const persistResult = await persistSceneImage(imageUrl, sceneId, 'first');
-            updateSplitSceneImage(sceneId, persistResult.localPath, scene.width, scene.height, persistResult.httpUrl || imageUrl);
+            updateSplitSceneImage(sceneId, persistResult.localPath, scene.width, scene.height, persistResult.httpUrl || undefined);
             autoSaveImageToLibrary(sceneId, persistResult.localPath);
             toast.success(`分镜 ${sceneId + 1} 图片生成完成，已保存到素材库`);
             setIsGenerating(false);
@@ -1687,7 +2140,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
             throw new Error(typeof errorMsg === 'string' ? errorMsg : JSON.stringify(errorMsg));
           }
 
-          await new Promise(r => setTimeout(r, pollInterval));
+          await new Promise<void>((resolve, reject) => {
+            const tid = setTimeout(resolve, pollInterval);
+            imageSignal.addEventListener('abort', () => { clearTimeout(tid); reject(new Error('用户已取消')); }, { once: true });
+          });
         }
         throw new Error('图片生成超时');
       }
@@ -1695,6 +2151,14 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       throw new Error('Invalid API response: no image URL or task ID');
     } catch (error) {
       const err = error as Error;
+
+      // 用户主动取消：abort() 触发的 AbortError 或自定义 '用户已取消'
+      if (err.name === 'AbortError' || err.message === '用户已取消') {
+        console.log(`[SplitScenes] Scene ${sceneId} image generation cancelled by user`);
+        setIsGenerating(false);
+        return;
+      }
+
       console.error(`[SplitScenes] Scene ${sceneId} image generation failed:`, err);
       updateSplitSceneImageStatus(sceneId, {
         imageStatus: 'failed',
@@ -1705,7 +2169,19 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     }
 
     setIsGenerating(false);
-  }, [splitScenes, storyboardConfig, storyboardImage, getApiKey, updateSplitSceneImage, updateSplitSceneImageStatus, autoSaveImageToLibrary, getCharacterReferenceImages]);
+  }, [
+    splitScenes,
+    storyboardConfig,
+    storyboardImage,
+    currentStyleId,
+    updateSplitSceneImage,
+    updateSplitSceneImageStatus,
+    autoSaveImageToLibrary,
+    getSceneCharacterContexts,
+    getCharacterReferenceImages,
+    buildPromptWithIdentityLock,
+    processReferenceImagesForApi,
+  ]);
 
   // ===== Utilities for 合并生成（九宫格） =====
   type Angle = 'Back View' | 'Over-the-Shoulder (OTS)' | 'POV' | 'Low Angle (Heroic)' | 'High Angle (Vulnerable)' | 'Dutch Angle (Tilted)';
@@ -1810,7 +2286,12 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       return;
     }
     
-    const apiKey = featureConfig.apiKey;
+    const keyManager = featureConfig.keyManager;
+    const apiKey = keyManager.getCurrentKey() || '';
+    if (!apiKey) {
+      toast.error('请先在设置中配置图片生成服务映射');
+      return;
+    }
     const platform = featureConfig.platform;
     const model = featureConfig.models?.[0];
     if (!model) {
@@ -1831,6 +2312,9 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
     const aspect = storyboardConfig.aspectRatio || '9:16';
     const styleTokens = storyboardConfig.styleTokens || [];
+    // 始终使用 getStylePrompt 获取完整风格提示词（保证有默认值，即使 styleTokens 为空）
+    const fullStylePrompt = getStylePrompt(currentStyleId);
+    const fullStyleNegative = getStyleNegativePrompt(currentStyleId);
     const dedup = (arr: string[]) => Array.from(new Set(arr.filter(Boolean)));
 
     // === 统一任务列表方案：支持混合九宫格 ===
@@ -1889,7 +2373,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         seenScenes.add(task.scene.id);
         if (task.scene.sceneReferenceImage) refs.push(task.scene.sceneReferenceImage);
         if (task.scene.characterIds?.length) {
-          refs.push(...getCharacterReferenceImages(task.scene.characterIds));
+          refs.push(...getCharacterReferenceImages(task.scene.characterIds, task.scene.characterVariationMap));
         }
       }
       // 去重并限制数量（API 限制 14 张）
@@ -1897,6 +2381,48 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     };
 
     // 根据分镜数量计算最优网格布局（强制 N x N 以保证比例一致性）
+    const collectOptimizedRefsFromTasks = (pageTasks: GridTask[]): string[] => {
+      if (strategy === 'none') return [];
+
+      const sceneRefs: string[] = [];
+      const characterRefs: string[] = [];
+      const anchorRefs: string[] = [];
+      const seenScenes = new Set<number>();
+
+      for (const task of pageTasks) {
+        if (seenScenes.has(task.scene.id)) continue;
+        seenScenes.add(task.scene.id);
+
+        const sceneRef = task.type === 'end'
+          ? (task.scene.endFrameSceneReferenceImage || task.scene.sceneReferenceImage)
+          : task.scene.sceneReferenceImage;
+        if (sceneRef) {
+          sceneRefs.push(sceneRef);
+        }
+
+        if (task.scene.characterIds?.length) {
+          characterRefs.push(...getCharacterReferenceImages(task.scene.characterIds, task.scene.characterVariationMap));
+        }
+
+        if (exemplar) {
+          const anchorImage = task.type === 'end'
+            ? (task.scene.imageDataUrl || task.scene.imageHttpUrl || undefined)
+            : (task.scene.endFrameImageUrl || task.scene.endFrameHttpUrl || undefined);
+          if (anchorImage) {
+            anchorRefs.push(anchorImage);
+          }
+        }
+      }
+
+      const optimizedRefs = optimizeReferenceImagesForModel(model, [
+        { kind: 'anchor', images: dedup(anchorRefs) },
+        { kind: 'character', images: dedup(characterRefs) },
+        { kind: 'scene', images: dedup(sceneRefs) },
+      ]);
+
+      return strategy === 'minimal' ? optimizedRefs.slice(0, 2) : optimizedRefs;
+    };
+
     const calculateGridLayout = (sceneCount: number): { cols: number; rows: number; paddedCount: number } => {
       // 策略：为了保证每个格子大小绝对均匀，强制使用 N x N 布局
       // 这样整张大图的宽高比 = 单个格子的宽高比
@@ -2019,7 +2545,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       // 构建增强版提示词 (参考用户提供的结构化 Prompt)
       const gridPromptParts: string[] = [];
       
-      // 1. 核心指令区 (Instruction Block)
+      // 1. 核心指令区 (Instruction Block) — 风格在此处前置，确保全局生效
       gridPromptParts.push('<instruction>');
       gridPromptParts.push(`Generate a clean ${rows}x${cols} storyboard grid with exactly ${paddedCount} equal-sized panels.`);
       gridPromptParts.push(`Overall Image Aspect Ratio: ${aspect}.`);
@@ -2028,8 +2554,21 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       const panelAspect = aspect === '16:9' ? '16:9 (horizontal landscape)' : '9:16 (vertical portrait)';
       gridPromptParts.push(`Each individual panel must have a ${panelAspect} aspect ratio.`);
       
+      // 全局视觉风格（前置到指令区，权重最高）
+      if (fullStylePrompt) {
+        gridPromptParts.push(`MANDATORY Visual Style for ALL panels: ${fullStylePrompt}`);
+      }
+      const pageHasCharacterRefs = pageTasks.some((task) =>
+        getSceneCharacterContexts(task.scene.characterIds || [], task.scene.characterVariationMap)
+          .some((context) => context.referenceImages.length > 0)
+      );
+      const referencePriorityHint = buildReferencePriorityHint(model, pageHasCharacterRefs);
+      if (referencePriorityHint) {
+        gridPromptParts.push(referencePriorityHint);
+      }
+      
       gridPromptParts.push('Structure: No borders between panels, no text, no watermarks, no speech bubbles.');
-      gridPromptParts.push('Consistency: Maintain consistent character appearance, lighting, and color grading across all panels.');
+      gridPromptParts.push('Consistency: Maintain consistent character appearance, lighting, color grading, and visual style across ALL panels.');
       gridPromptParts.push('</instruction>');
       
       // 2. 布局描述 (Layout)
@@ -2046,6 +2585,14 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         } else {
           desc = s.imagePromptZh?.trim() || s.imagePrompt?.trim() || s.videoPromptZh?.trim() || s.videoPrompt?.trim() || `scene ${idx + 1}`;
         }
+        const sceneCharacterContexts = getSceneCharacterContexts(s.characterIds || [], s.characterVariationMap);
+        const identityInline = getSceneIdentityLockLines(
+          s,
+          model,
+          sceneCharacterContexts.some((context) => context.referenceImages.length > 0),
+        )
+          .map((line) => line.replace(/^- /, '').trim())
+          .join(' ');
         
         // 人物数量约束
         const charCount = s.characterIds?.length || 0;
@@ -2057,7 +2604,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         
         // 标记是首帧还是尾帧
         const frameLabel = task.type === 'end' ? '[END FRAME]' : '[FIRST FRAME]';
-        gridPromptParts.push(`Panel [row ${row}, col ${col}] ${frameLabel} ${charConstraint}: ${desc}`);
+        // 每格附带风格锚定，防止多面板时模型遗忘全局风格
+        const styleAnchor = fullStylePrompt ? ` [same style]` : '';
+        const identitySuffix = identityInline ? ` Identity lock: ${identityInline}` : '';
+        gridPromptParts.push(`Panel [row ${row}, col ${col}] ${frameLabel} ${charConstraint}: ${desc}${styleAnchor}${identitySuffix}`);
       });
       
       // 4. 空白占位格描述
@@ -2067,13 +2617,15 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         gridPromptParts.push(`Panel [row ${row}, col ${col}]: empty placeholder, solid gray background`);
       }
       
-      // 5. 全局风格
-      if (styleTokens.length > 0) {
-        gridPromptParts.push(`Style: ${styleTokens.join(', ')}`);
+      // 5. 全局风格（尾部再次强调，首尾夹击确保风格一致性）
+      if (fullStylePrompt) {
+        gridPromptParts.push(`IMPORTANT - Apply this EXACT style uniformly to every panel: ${fullStylePrompt}`);
       }
       
-      // 6. 负面提示词 (Negative Constraints)
-      gridPromptParts.push('Negative constraints: text, watermark, split screen borders, speech bubbles, blur, distortion, bad anatomy.');
+      // 6. 负面提示词 (Negative Constraints) — 合并风格专属负面提示
+      const baseNegative = 'text, watermark, split screen borders, speech bubbles, blur, distortion, bad anatomy';
+      const styleNeg = fullStyleNegative ? `, ${fullStyleNegative}` : '';
+      gridPromptParts.push(`Negative constraints: ${baseNegative}${styleNeg}`);
       
       const gridPrompt = gridPromptParts.join('\n'); // 使用换行符分隔更清晰
       console.log('[MergedGen] Grid prompt:', gridPrompt.substring(0, 200) + '...');
@@ -2086,6 +2638,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
           updateSplitSceneImageStatus(task.scene.id, { imageStatus: 'generating', imageProgress: 10 });
         }
       });
+      const apiReferenceImages = await processReferenceImagesForApi(refs, '[MergedGen]');
       
       // 构建参考图列表
       const finalRefs = refs.slice(0, 14);
@@ -2131,7 +2684,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       };
       
       // 调用 API 生成九宫格图片 - 使用智能路由（自动选择 chat completions 或 images/generations）
-      console.log('[MergedGen] Calling API with', processedRefs.length, 'reference images, model:', model);
+      console.log('[MergedGen] Calling API with', apiReferenceImages.length, 'reference images, model:', model);
       const apiResult = await submitGridImageRequest({
         model,
         prompt: gridPrompt,
@@ -2139,7 +2692,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         baseUrl: imageBaseUrl,
         aspectRatio: gridAspect,
         resolution: storyboardConfig.resolution || '2K',
-        referenceImages: processedRefs.length > 0 ? processedRefs : undefined,
+        referenceImages: apiReferenceImages.length > 0
+          ? apiReferenceImages
+          : (processedRefs.length > 0 ? processedRefs : undefined),
+        keyManager,
       });
       
       let gridImageUrl = apiResult.imageUrl;
@@ -2219,7 +2775,6 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       // 回填到各分镜并自动保存到素材库
       // 同时上传切割后的图片到图床，避免视频生成时再次上传
       const folderId = getImageFolderId();
-      const { uploadToImageHost, isImageHostConfigured } = await import('@/lib/image-host');
       const imageHostConfigured = isImageHostConfigured();
       
       // 回填：根据任务类型决定更新首帧还是尾帧
@@ -2269,40 +2824,114 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       return slicedImages;
     };
 
-    try {
-      // 统一循环：每页任务可能混合首帧和尾帧
-      for (let p = 0; p < taskPages.length; p++) {
-        if (mergedAbortRef.current) {
-          console.log('[MergedGen] 用户停止合并生成');
-          toast.info('合并生成已停止');
-          return;
+    // 辅助：重置一页中所有任务的状态为 failed
+    const resetPageTasksToError = (pageTasks: GridTask[], errorMsg: string) => {
+      for (const task of pageTasks) {
+        if (task.type === 'end') {
+          updateSplitSceneEndFrameStatus(task.scene.id, { endFrameStatus: 'failed', endFrameProgress: 0, endFrameError: errorMsg });
+        } else {
+          updateSplitSceneImageStatus(task.scene.id, { imageStatus: 'failed', imageProgress: 0, imageError: errorMsg });
         }
-        
-        const pageTasks = taskPages[p];
-        const refs = collectRefsFromTasks(pageTasks);
-        
-        // 统计当前页的首帧/尾帧数量
-        const pageFirstCount = pageTasks.filter(t => t.type === 'first').length;
-        const pageEndCount = pageTasks.filter(t => t.type === 'end').length;
-        const pageInfo = [pageFirstCount > 0 ? `${pageFirstCount}首帧` : '', pageEndCount > 0 ? `${pageEndCount}尾帧` : ''].filter(Boolean).join('+');
-        
-        console.log(`[MergedGen] 第 ${p + 1}/${taskPages.length} 页，${pageTasks.length} 个任务（${pageInfo}），${refs.length} 张参考图`);
-        
+      }
+    };
+
+    // 第一轮：逐页尝试，失败的页面记录下来继续下一页
+    const failedPages: { index: number; pageTasks: GridTask[]; refs: string[]; error: string }[] = [];
+    let succeededCount = 0;
+
+    for (let p = 0; p < taskPages.length; p++) {
+      if (mergedAbortRef.current) {
+        console.log('[MergedGen] 用户停止合并生成');
+        toast.info('合并生成已停止');
+        setIsMergedRunning(false);
+        return;
+      }
+      
+      const pageTasks = taskPages[p];
+      const refs = collectOptimizedRefsFromTasks(pageTasks);
+      
+      // 统计当前页的首帧/尾帧数量
+      const pageFirstCount = pageTasks.filter(t => t.type === 'first').length;
+      const pageEndCount = pageTasks.filter(t => t.type === 'end').length;
+      const pageInfo = [pageFirstCount > 0 ? `${pageFirstCount}首帧` : '', pageEndCount > 0 ? `${pageEndCount}尾帧` : ''].filter(Boolean).join('+');
+      
+      console.log(`[MergedGen] 第 ${p + 1}/${taskPages.length} 页，${pageTasks.length} 个任务（${pageInfo}），${refs.length} 张参考图`);
+      
+      try {
         await generateGridAndSlice(pageTasks, refs);
+        succeededCount++;
         if (!mergedAbortRef.current) {
           toast.success(`第 ${p + 1}/${taskPages.length} 页完成（${pageInfo}）`);
         }
+      } catch (e: any) {
+        const errorMsg = e.message || String(e);
+        console.error(`[MergedGen] 第 ${p + 1} 页失败:`, errorMsg);
+        // 重置该页分镜状态为 error，不让它们卡在 'generating'
+        resetPageTasksToError(pageTasks, errorMsg);
+        failedPages.push({ index: p, pageTasks, refs, error: errorMsg });
+        toast.warning(`第 ${p + 1}/${taskPages.length} 页失败，将自动重试：${errorMsg.substring(0, 60)}`);
+        // 继续下一页，不中断
       }
-      
-      if (!mergedAbortRef.current) toast.success('九宫格合并生成完成！');
-    } catch (e: any) {
-      console.error('[MergedGen] 失败:', e);
-      toast.error(`合并生成失败: ${e.message || e}`);
-    } finally {
-      setIsMergedRunning(false);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [splitScenes, storyboardConfig, getApiKey, updateSplitSceneImage, updateSplitSceneImageStatus, updateSplitSceneEndFrame, updateSplitSceneEndFrameStatus]);
+
+    // 第二轮：自动重试失败的页面（延迟 5 秒后重试，给 API 恢复时间）
+    if (failedPages.length > 0 && !mergedAbortRef.current) {
+      console.log(`[MergedGen] ${failedPages.length} 页失败，5 秒后自动重试...`);
+      toast.info(`${failedPages.length} 页生成失败，5 秒后自动重试...`);
+      await new Promise(r => setTimeout(r, 5000));
+
+      for (const fp of failedPages) {
+        if (mergedAbortRef.current) break;
+
+        const pageFirstCount = fp.pageTasks.filter(t => t.type === 'first').length;
+        const pageEndCount = fp.pageTasks.filter(t => t.type === 'end').length;
+        const pageInfo = [pageFirstCount > 0 ? `${pageFirstCount}首帧` : '', pageEndCount > 0 ? `${pageEndCount}尾帧` : ''].filter(Boolean).join('+');
+
+        console.log(`[MergedGen] 自动重试第 ${fp.index + 1} 页（${pageInfo}）`);
+        try {
+          // 重新收集参考图（可能在其他页成功后有新的图可用）
+          const freshRefs = collectOptimizedRefsFromTasks(fp.pageTasks);
+          await generateGridAndSlice(fp.pageTasks, freshRefs);
+          succeededCount++;
+          toast.success(`第 ${fp.index + 1} 页重试成功（${pageInfo}）`);
+        } catch (retryErr: any) {
+          const retryMsg = retryErr.message || String(retryErr);
+          console.error(`[MergedGen] 第 ${fp.index + 1} 页重试仍然失败:`, retryMsg);
+          // 再次重置为 error 状态
+          resetPageTasksToError(fp.pageTasks, `重试失败: ${retryMsg}`);
+          toast.error(`第 ${fp.index + 1} 页重试失败: ${retryMsg.substring(0, 80)}`);
+        }
+      }
+    }
+
+    // 最终汇报
+    const totalPages = taskPages.length;
+    if (!mergedAbortRef.current) {
+      if (succeededCount === totalPages) {
+        toast.success('九宫格合并生成全部完成！');
+      } else if (succeededCount > 0) {
+        toast.warning(`合并生成部分完成：${succeededCount}/${totalPages} 页成功，${totalPages - succeededCount} 页失败`);
+      } else {
+        toast.error(`合并生成全部失败（${totalPages} 页），请检查 API 服务后重试`);
+      }
+    }
+    setIsMergedRunning(false);
+  }, [
+    splitScenes,
+    storyboardConfig,
+    currentStyleId,
+    updateSplitSceneImage,
+    updateSplitSceneImageStatus,
+    updateSplitSceneEndFrame,
+    updateSplitSceneEndFrameStatus,
+    getSceneCharacterContexts,
+    getSceneIdentityLockLines,
+    getCharacterReferenceImages,
+    processReferenceImagesForApi,
+    getImageFolderId,
+    addMediaFromUrl,
+    mediaProjectId,
+  ]);
 
   // 复用单图生成的 API 路径，封装为通用函数（支持首帧/尾帧）
   // 合并生成专用：使用预计算参考列表；不降级到单图通道
@@ -2330,7 +2959,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     if (!model) {
       throw new Error('请先在设置中配置图片生成模型');
     }
-    const apiKeyToUse = apiKey || featureConfig.apiKey;
+    const apiKeyToUse = apiKey || featureConfig.keyManager.getCurrentKey() || '';
     if (!apiKeyToUse) {
       throw new Error('请先在设置中配置图片生成服务映射');
     }
@@ -2340,6 +2969,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     }
 
     // Call image generation API with smart routing
+    const mergedKeyManager = featureConfig.keyManager;
     const apiResult = await submitGridImageRequest({
       model,
       prompt,
@@ -2348,6 +2978,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       aspectRatio: aspect,
       resolution: storyboardConfig.resolution || '2K',
       referenceImages: refUrls && refUrls.length > 0 ? refUrls.slice(0, 14) : undefined,
+      keyManager: mergedKeyManager,
     });
 
     const normalizeUrlValue = (url: any): string | undefined => Array.isArray(url) ? (url[0] || undefined) : (typeof url === 'string' ? url : undefined);
@@ -2363,6 +2994,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
           apiKey: apiKeyToUse,
           baseUrl: imageBaseUrl,
           aspectRatio: aspect,
+          keyManager: mergedKeyManager,
         });
         directUrl = retryResult.imageUrl;
         taskId = retryResult.taskId;
@@ -2373,6 +3005,11 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     if (!directUrl && taskId) {
       const pollInterval = 2000, maxAttempts = 60;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        // 检查合并生成是否已被用户停止
+        if (mergedAbortRef.current) {
+          console.log(`[MergedGen] Scene ${sceneId} polling cancelled by user`);
+          return;
+        }
         const progress = Math.min(Math.floor((attempt / maxAttempts) * 100), 99);
         if (isEndFrame) updateSplitSceneEndFrameStatus(sceneId, { endFrameProgress: progress });
         else updateSplitSceneImageStatus(sceneId, { imageProgress: progress });
@@ -2399,10 +3036,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     const persistResult = await persistSceneImage(directUrl, sceneId, frameType);
 
     if (isEndFrame) {
-      updateSplitSceneEndFrame(sceneId, persistResult.localPath, 'ai-generated', persistResult.httpUrl || directUrl);
+      updateSplitSceneEndFrame(sceneId, persistResult.localPath, 'ai-generated', persistResult.httpUrl);
     } else {
       const sceneObj = splitScenes.find(s => s.id === sceneId)!;
-      updateSplitSceneImage(sceneId, persistResult.localPath, sceneObj.width, sceneObj.height, persistResult.httpUrl || directUrl);
+      updateSplitSceneImage(sceneId, persistResult.localPath, sceneObj.width, sceneObj.height, persistResult.httpUrl || undefined);
     }
     return { finalBase64: persistResult.localPath, directUrl };
   };
@@ -2426,7 +3063,8 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       toast.error('请先在设置中配置图片生成服务映射');
       return;
     }
-    const apiKey = featureConfig.apiKey;
+    const keyManager = featureConfig.keyManager;
+    const apiKey = keyManager.getCurrentKey() || '';
     if (!apiKey) {
       toast.error('请先在设置中配置图片生成服务映射');
       return;
@@ -2447,6 +3085,11 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
 
     setIsGenerating(true);
 
+    // 创建本次尾帧生成的 AbortController，停止按钮可通过 endFrameAbortRef.current.abort() 取消
+    const endFrameController = new AbortController();
+    endFrameAbortRef.current = endFrameController;
+    const endFrameSignal = endFrameController.signal;
+
     try {
       // Update end frame status
       updateSplitSceneEndFrameStatus(sceneId, {
@@ -2461,6 +3104,9 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       if (fullStylePrompt) {
         enhancedPrompt = `${promptToUse}. Style: ${fullStylePrompt}`;
       }
+      const sceneCharacterRefs = getCharacterReferenceImages(scene.characterIds || [], scene.characterVariationMap);
+      const hasCharacterRefs = sceneCharacterRefs.length > 0;
+      enhancedPrompt = buildPromptWithIdentityLock(enhancedPrompt, scene, model, hasCharacterRefs);
 
       // Collect reference images - include scene background and first frame for consistency
       const referenceImages: string[] = [];
@@ -2482,19 +3128,28 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       
       // 3. 角色参考图
       if (scene.characterIds && scene.characterIds.length > 0) {
-        const sceneCharRefs = getCharacterReferenceImages(scene.characterIds);
+        const sceneCharRefs = getCharacterReferenceImages(scene.characterIds, scene.characterVariationMap);
         referenceImages.push(...sceneCharRefs);
       }
+
+      const startFrameAnchor = scene.imageDataUrl || scene.imageHttpUrl || undefined;
+      const endFrameSceneRef = scene.endFrameSceneReferenceImage || scene.sceneReferenceImage || undefined;
+      const optimizedReferenceImages = optimizeReferenceImagesForModel(model, [
+        { kind: 'scene', images: endFrameSceneRef ? [endFrameSceneRef] : [] },
+        { kind: 'anchor', images: startFrameAnchor ? [startFrameAnchor] : [] },
+        { kind: 'character', images: sceneCharacterRefs },
+      ]);
+      const apiReferenceImages = await processReferenceImagesForApi(optimizedReferenceImages, '[EndFrame]');
 
       console.log('[SplitScenes] Generating end frame:', {
         sceneId,
         prompt: enhancedPrompt.substring(0, 100),
-        referenceCount: referenceImages.length,
+        referenceCount: optimizedReferenceImages.length,
       });
 
       // Process reference images for API
       const processedRefs: string[] = [];
-      for (const url of referenceImages.slice(0, 4)) {
+      for (const url of referenceImages.slice(0, 14)) {
         if (!url) continue;
         if (url.startsWith('http://') || url.startsWith('https://')) {
           processedRefs.push(url);
@@ -2518,7 +3173,11 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         baseUrl: imageBaseUrl,
         aspectRatio: storyboardConfig.aspectRatio || '9:16',
         resolution: storyboardConfig.resolution || '2K',
-        referenceImages: processedRefs.length > 0 ? processedRefs : undefined,
+        referenceImages: apiReferenceImages.length > 0
+          ? apiReferenceImages
+          : (processedRefs.length > 0 ? processedRefs : undefined),
+        keyManager,
+        signal: endFrameSignal,
       });
 
       // Helper to normalize URL (handle array format) - used in poll responses
@@ -2532,7 +3191,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       // Direct URL result
       if (apiResult.imageUrl) {
         const persistResult = await persistSceneImage(apiResult.imageUrl, sceneId, 'end');
-        updateSplitSceneEndFrame(sceneId, persistResult.localPath, 'ai-generated', persistResult.httpUrl || apiResult.imageUrl);
+        updateSplitSceneEndFrame(sceneId, persistResult.localPath, 'ai-generated', persistResult.httpUrl);
         // 自动保存尾帧到素材库
         const folderId = getImageFolderId();
         addMediaFromUrl({
@@ -2568,6 +3227,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
               'Authorization': `Bearer ${apiKey}`,
               'Cache-Control': 'no-cache',
             },
+            signal: endFrameSignal,
           });
 
           if (!statusResponse.ok) {
@@ -2591,7 +3251,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
             
             // 持久化到本地 + 图床
             const persistResult = await persistSceneImage(imageUrl, sceneId, 'end');
-            updateSplitSceneEndFrame(sceneId, persistResult.localPath, 'ai-generated', persistResult.httpUrl || imageUrl);
+            updateSplitSceneEndFrame(sceneId, persistResult.localPath, 'ai-generated', persistResult.httpUrl);
             // 自动保存尾帧到素材库
             const folderId = getImageFolderId();
             addMediaFromUrl({
@@ -2612,7 +3272,10 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
             throw new Error(typeof errorMsg === 'string' ? errorMsg : JSON.stringify(errorMsg));
           }
 
-          await new Promise(r => setTimeout(r, pollInterval));
+          await new Promise<void>((resolve, reject) => {
+            const tid = setTimeout(resolve, pollInterval);
+            endFrameSignal.addEventListener('abort', () => { clearTimeout(tid); reject(new Error('用户已取消')); }, { once: true });
+          });
         }
         throw new Error('尾帧生成超时');
       }
@@ -2620,6 +3283,14 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       throw new Error('Invalid API response');
     } catch (error) {
       const err = error as Error;
+
+      // 用户主动取消：abort() 触发的 AbortError 或自定义 '用户已取消'
+      if (err.name === 'AbortError' || err.message === '用户已取消') {
+        console.log(`[SplitScenes] Scene ${sceneId} end frame generation cancelled by user`);
+        setIsGenerating(false);
+        return;
+      }
+
       console.error(`[SplitScenes] Scene ${sceneId} end frame generation failed:`, err);
       updateSplitSceneEndFrameStatus(sceneId, {
         endFrameStatus: 'failed',
@@ -2630,7 +3301,19 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     }
 
     setIsGenerating(false);
-  }, [splitScenes, storyboardConfig, getApiKey, updateSplitSceneEndFrame, updateSplitSceneEndFrameStatus, getCharacterReferenceImages]);
+  }, [
+    splitScenes,
+    storyboardConfig,
+    currentStyleId,
+    updateSplitSceneEndFrame,
+    updateSplitSceneEndFrameStatus,
+    getImageFolderId,
+    addMediaFromUrl,
+    mediaProjectId,
+    getCharacterReferenceImages,
+    buildPromptWithIdentityLock,
+    processReferenceImagesForApi,
+  ]);
 
   // Save to media library (image or video) - uses system category folders
   const handleSaveToLibrary = useCallback(async (scene: SplitScene, type: 'image' | 'video') => {
@@ -2675,19 +3358,13 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
   }, [addMediaFromUrl, getImageFolderId, getVideoFolderId, mediaProjectId]);
 
   // Show empty state
-  if (storyboardStatus !== 'editing' || splitScenes.length === 0) {
+  if (splitScenes.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-12 space-y-4">
         <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center">
           <ImageIcon className="h-8 w-8 text-muted-foreground" />
         </div>
         <p className="text-sm text-muted-foreground">暂无切割的分镜</p>
-        {onBack && (
-          <Button variant="outline" onClick={onBack} className="mt-2">
-            <ArrowLeft className="h-4 w-4 mr-2" />
-            返回
-          </Button>
-        )}
       </div>
     );
   }
@@ -2745,7 +3422,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
                     size="sm"
                     onClick={handleAutoGeneratePrompts}
                     disabled={isGeneratingPrompts || isGenerating}
-                    className="h-7 px-2 text-xs"
+                    className="hidden h-7 px-2 text-xs"
                   >
                     {isGeneratingPrompts ? (
                       <Loader2 className="h-3 w-3 mr-1 animate-spin" />
@@ -2801,7 +3478,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-muted-foreground whitespace-nowrap">视觉风格:</span>
                   <StylePicker
-                    value={currentStyleId}
+                    value={currentStyleId || ''}
                     onChange={handleStyleChange}
                     disabled={isGenerating}
                   />
@@ -2882,12 +3559,14 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
                   <SceneCard
                     key={scene.id}
                     scene={scene}
+                    promptLanguage={promptLanguage}
                     onUpdateImagePrompt={(id, prompt, promptZh) => updateSplitSceneImagePrompt(id, prompt, promptZh)}
                     onUpdateVideoPrompt={(id, prompt, promptZh) => updateSplitSceneVideoPrompt(id, prompt, promptZh)}
                     onUpdateEndFramePrompt={(id, prompt, promptZh) => updateSplitSceneEndFramePrompt(id, prompt, promptZh)}
                     onUpdateNeedsEndFrame={(id, needsEndFrame) => updateSplitSceneNeedsEndFrame(id, needsEndFrame)}
                     onUpdateEndFrame={handleUpdateEndFrame}
                     onUpdateCharacters={handleUpdateCharacters}
+                    onUpdateCharacterVariationMap={handleUpdateCharacterVariationMap}
                     onUpdateEmotions={handleUpdateEmotions}
                     onUpdateShotSize={handleUpdateShotSize}
                     onUpdateDuration={handleUpdateDuration}
@@ -2983,7 +3662,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
             size="sm"
             onClick={handleAutoGeneratePrompts}
             disabled={isGeneratingPrompts || isGenerating}
-            className="h-7 px-2 text-xs"
+            className="hidden h-7 px-2 text-xs"
           >
             {isGeneratingPrompts ? (
               <Loader2 className="h-3 w-3 mr-1 animate-spin" />
@@ -2996,7 +3675,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
             variant="text"
             size="sm"
             onClick={handleBack}
-            className="h-7 px-2 text-xs"
+            className="hidden h-7 px-2 text-xs"
           >
             <ArrowLeft className="h-3 w-3 mr-1" />
             重新生成
@@ -3010,7 +3689,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
         <div className="flex items-center gap-2">
           <span className="text-xs text-muted-foreground whitespace-nowrap">视觉风格:</span>
           <StylePicker
-            value={currentStyleId}
+            value={currentStyleId || ''}
             onChange={handleStyleChange}
             disabled={isGenerating}
           />
@@ -3023,7 +3702,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
             value={currentCinProfileId}
             onChange={handleCinProfileChange}
             disabled={isGenerating}
-            styleId={currentStyleId}
+            styleId={currentStyleId || undefined}
           />
         </div>
 
@@ -3198,7 +3877,7 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       )}
 
       {/* Warning if no prompts */}
-      {splitScenes.some(s => !s.videoPrompt.trim()) && (
+      {splitScenes.some(s => !(s.videoPromptZh?.trim() || s.videoPrompt?.trim())) && (
         <div className="flex items-start gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20">
           <AlertCircle className="h-4 w-4 text-yellow-500 mt-0.5 shrink-0" />
           <div className="text-xs text-yellow-600 dark:text-yellow-400">
@@ -3213,12 +3892,14 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
           <SceneCard
             key={scene.id}
             scene={scene}
+            promptLanguage={promptLanguage}
             onUpdateImagePrompt={(id, prompt, promptZh) => updateSplitSceneImagePrompt(id, prompt, promptZh)}
             onUpdateVideoPrompt={(id, prompt, promptZh) => updateSplitSceneVideoPrompt(id, prompt, promptZh)}
             onUpdateEndFramePrompt={(id, prompt, promptZh) => updateSplitSceneEndFramePrompt(id, prompt, promptZh)}
             onUpdateNeedsEndFrame={(id, needsEndFrame) => updateSplitSceneNeedsEndFrame(id, needsEndFrame)}
             onUpdateEndFrame={handleUpdateEndFrame}
             onUpdateCharacters={handleUpdateCharacters}
+            onUpdateCharacterVariationMap={handleUpdateCharacterVariationMap}
             onUpdateEmotions={handleUpdateEmotions}
             onUpdateShotSize={handleUpdateShotSize}
             onUpdateDuration={handleUpdateDuration}
@@ -3246,6 +3927,23 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
             isGeneratingAny={isGenerating}
           />
         ))}
+
+        {/* 添加空白分镜按钮 */}
+        <button
+          type="button"
+          onClick={addBlankSplitScene}
+          disabled={isGenerating}
+          className={cn(
+            "w-full rounded-lg border-2 border-dashed border-muted-foreground/25",
+            "flex items-center justify-center gap-2 py-6",
+            "text-sm text-muted-foreground hover:border-primary/50 hover:text-primary hover:bg-primary/5",
+            "transition-colors cursor-pointer",
+            "disabled:opacity-50 disabled:cursor-not-allowed",
+          )}
+        >
+          <Plus className="h-5 w-5" />
+          <span>添加空白分镜</span>
+        </button>
       </div>
 
       {/* Action buttons */}
@@ -3365,3 +4063,4 @@ export function SplitScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
     </div>
   );
 }
+

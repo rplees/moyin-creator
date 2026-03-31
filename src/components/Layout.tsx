@@ -24,6 +24,8 @@ import { FreedomView } from "@/components/panels/freedom";
 import { MediaView } from "@/components/panels/media";
 import { SettingsPanel } from "@/components/panels/SettingsPanel";
 import { ExportView } from "@/components/panels/export";
+import { OverviewPanel } from "@/components/panels/overview";
+import { AssetsView } from "@/components/panels/assets";
 
 export function Layout() {
   const { activeTab, inProject } = useMediaPanelStore();
@@ -42,19 +44,21 @@ export function Layout() {
 
   // Full-screen views (no resizable panels)
   // 这些板块有自己的多栏布局，不需要全局的预览和属性面板
-  const fullScreenTabs = ["export", "settings", "script", "characters", "scenes", "freedom"];
+  const fullScreenTabs = ["export", "settings", "overview", "script", "characters", "scenes", "freedom", "assets"];
   if (fullScreenTabs.includes(activeTab)) {
     return (
       <div className="h-full flex bg-background">
         <TabBar />
-        <div className="flex-1 flex flex-col">
+        <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
           <ProjectHeader />
           {activeTab === "export" && <ExportView />}
           {activeTab === "settings" && <SettingsPanel />}
+          {activeTab === "overview" && <OverviewPanel />}
           {activeTab === "script" && <ScriptView />}
           {activeTab === "characters" && <CharactersView />}
           {activeTab === "scenes" && <ScenesView />}
           {activeTab === "freedom" && <FreedomView />}
+          {activeTab === "assets" && <AssetsView />}
         </div>
       </div>
     );
@@ -97,18 +101,18 @@ export function Layout() {
       <TabBar />
 
       {/* Right content area */}
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 min-w-0 flex flex-col">
         {/* Top: Project Header with save status */}
         <ProjectHeader />
         
         {/* Main content with resizable panels */}
-        <ResizablePanelGroup direction="vertical" className="flex-1">
+        <ResizablePanelGroup direction="vertical" className="flex-1 min-h-0 min-w-0">
         {/* Main content row */}
-        <ResizablePanel defaultSize={85} minSize={50}>
-          <ResizablePanelGroup direction="horizontal">
+        <ResizablePanel defaultSize={85} minSize={50} className="min-h-0 min-w-0">
+          <ResizablePanelGroup direction="horizontal" className="min-h-0 min-w-0">
             {/* Left Panel: Content based on active tab */}
-            <ResizablePanel id="moyin-left-panel" defaultSize={28} minSize={20} maxSize={45}>
-              <div className="h-full overflow-hidden bg-panel border-r border-border">
+            <ResizablePanel defaultSize={26} minSize={18} maxSize={40} className="min-w-0">
+              <div className="h-full min-w-0 overflow-hidden bg-panel border-r border-border">
                 {renderLeftPanel()}
               </div>
             </ResizablePanel>
@@ -116,8 +120,8 @@ export function Layout() {
             <ResizableHandle />
 
             {/* Center: Preview */}
-            <ResizablePanel id="moyin-center-panel" defaultSize={52} minSize={25}>
-              <div className="h-full overflow-hidden">
+            <ResizablePanel defaultSize={54} minSize={28} className="min-w-0">
+              <div className="h-full min-w-0 overflow-hidden">
                 <PreviewPanel />
               </div>
             </ResizablePanel>
@@ -125,8 +129,8 @@ export function Layout() {
             <ResizableHandle />
 
             {/* Right: Properties */}
-            <ResizablePanel id="moyin-right-panel" defaultSize={20} minSize={12} maxSize={35}>
-              <div className="h-full overflow-hidden border-l border-border">
+            <ResizablePanel defaultSize={20} minSize={15} maxSize={32} className="min-w-0">
+              <div className="h-full min-w-0 overflow-hidden border-l border-border">
                 {renderRightPanel()}
               </div>
             </ResizablePanel>
