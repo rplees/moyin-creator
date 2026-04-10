@@ -169,6 +169,10 @@ const MODEL_CAPABILITIES: Record<string, ModelCapability[]> = {
 
   // ---- RunningHub 特殊模型 ----
   '2009613632530812930': ['image_generation'],
+  // ---- 直接即梦Web插件模型 ----
+  'jimeng-image-plugin': ['image_generation'],
+  'jimeng-image-plugin-3': ['image_generation'],
+  'jimeng-image-plugin-4': ['image_generation'],
 };
 
 function providerSupportsCapability(

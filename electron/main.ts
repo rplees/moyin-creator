@@ -165,6 +165,7 @@ function createWindow() {
     minWidth: 1200,
     minHeight: 700,
     webPreferences: {
+      webSecurity: false,  // 禁用以下所有安全策略
       preload: path.join(__dirname, '../preload/index.cjs'),
     },
   })

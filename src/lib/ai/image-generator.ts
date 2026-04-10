@@ -552,6 +552,7 @@ async function submitImageTask(
     prompt,
     n: 1,
     size: sizeValue,
+    resolution: resolution,
     stream: false,
   };
 
