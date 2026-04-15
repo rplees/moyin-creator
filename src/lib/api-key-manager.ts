@@ -36,6 +36,7 @@ export interface IProvider {
  * 核心供应商：
  * 1. 魔因API (memefast) - 全功能 AI 中转（推荐），支持文本/图片/视频/识图
  * 2. RunningHub - 视角切换/多角度生成
+ * 3. Jimeng - 直接即梦Web插件模型，支持图片/视频生成
  */
 export const DEFAULT_PROVIDERS: Omit<IProvider, 'id' | 'apiKey'>[] = [
   {
@@ -79,7 +80,7 @@ export function classifyModelByName(modelName: string): ModelCapability[] {
   const videoPatterns = [
     'veo', 'sora', 'wan', 'kling', 'runway', 'luma', 'seedance',
     'cogvideo', 'hunyuan-video', 'minimax-video', 'hailuo', 'pika',
-    'gen-3', 'gen3', 'mochi', 'ltx',
+    'gen-3', 'gen3', 'mochi', 'ltx', 'jimeng_video',
   ];
   // 精确匹配：grok-video 类
   if (/grok[- ]?video/.test(name)) return ['video_generation'];
@@ -89,7 +90,7 @@ export function classifyModelByName(modelName: string): ModelCapability[] {
   const imageGenPatterns = [
     'dall-e', 'dalle', 'flux', 'midjourney', 'niji', 'imagen', 'cogview',
     'gpt-image', 'ideogram', 'sd3', 'stable-diffusion', 'sdxl',
-    'playground', 'recraft', 'kolors', 'seedream',
+    'playground', 'recraft', 'kolors', 'seedream', 'jimeng_image', 'jimeng-image',
   ];
   if (imageGenPatterns.some(p => name.includes(p))) return ['image_generation'];
   // "xxx-image-preview" 类（如 gemini-3-pro-image-preview）

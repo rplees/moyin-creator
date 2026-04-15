@@ -495,7 +495,8 @@ export function GenerationPanel({ selectedScene, onSceneCreated }: GenerationPan
       for (let i = actualCount; i < paddedCount; i++) {
         const row = Math.floor(i / newLayout.cols) + 1;
         const col = (i % newLayout.cols) + 1;
-        promptParts.push(`Panel [row ${row}, col ${col}]: empty placeholder, solid gray background`);
+        // 删除 empty placeholder,  只保留 solid gray background
+        promptParts.push(`Panel [row ${row}, col ${col}]: solid gray background`);
       }
       
       // 5. 风格与负面提示

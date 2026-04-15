@@ -170,9 +170,9 @@ const MODEL_CAPABILITIES: Record<string, ModelCapability[]> = {
   // ---- RunningHub 特殊模型 ----
   '2009613632530812930': ['image_generation'],
   // ---- 直接即梦Web插件模型 ----
-  'jimeng-image-plugin': ['image_generation'],
-  'jimeng-image-plugin-3': ['image_generation'],
-  'jimeng-image-plugin-4': ['image_generation'],
+  // 'jimeng-image-plugin': ['image_generation'],
+  // 'jimeng-image-plugin-3': ['image_generation'],
+  // 'jimeng-image-plugin-4': ['image_generation'],
 };
 
 function providerSupportsCapability(
@@ -205,7 +205,7 @@ function modelSupportsCapability(
   modelTagsList?: string[] // ["对话","识图","工具"]
 ): boolean {
   if (!required) return true;
-
+  // console.log('modelName===========', modelName, "provider:", JSON.stringify(provider), "required:", required, "modelType:", modelType, "modelTagsList:" , modelTagsList);
   // 1. 硬编码映射（精确控制少量预设模型）
   const modelCaps = MODEL_CAPABILITIES[modelName];
   if (modelCaps) {
@@ -234,6 +234,7 @@ function modelSupportsCapability(
 
   // 3. 模型名称模式推断（非 MemeFast 的其他供应商）
   const inferred = classifyModelByName(modelName);
+  console.log('inferred===========', inferred, "modelName:", modelName);
   if (inferred.length > 0) {
     return inferred.includes(required);
   }

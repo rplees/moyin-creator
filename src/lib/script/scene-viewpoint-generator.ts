@@ -603,7 +603,8 @@ export function generateContactSheetPrompt(config: ContactSheetConfig): ContactS
   for (let i = viewpoints.length; i < paddedCount; i++) {
     const row = Math.floor(i / gridLayout.cols) + 1;
     const col = (i % gridLayout.cols) + 1;
-    promptParts.push(`Panel [row ${row}, col ${col}]: empty placeholder, solid gray background`);
+    // 删除 empty placeholder,  只保留 solid gray background
+    promptParts.push(`Panel [row ${row}, col ${col}]: solid gray background`);
   }
   
     // 6. 全局风格尾部再次强调（三层夹击第三层）
@@ -1123,7 +1124,8 @@ export function generateMultiPageContactSheetData(
     for (let i = actualCount; i < paddedCount; i++) {
       const row = Math.floor(i / gridLayout.cols) + 1;
       const col = (i % gridLayout.cols) + 1;
-      promptParts.push(`Panel [row ${row}, col ${col}]: empty placeholder, solid gray background`);
+      // 删除 empty placeholder,  只保留 solid gray background
+      promptParts.push(`Panel [row ${row}, col ${col}]: solid gray background`);
     }
     
     // 6. 全局风格尾部再次强调（三层夹击第三层）
@@ -1343,7 +1345,8 @@ export function buildContactSheetDataFromViewpoints(
     for (let i = actualCount; i < paddedCount; i++) {
       const row = Math.floor(i / gridLayout.cols) + 1;
       const col = (i % gridLayout.cols) + 1;
-      promptParts.push(`Panel [row ${row}, col ${col}]: empty placeholder, solid gray background`);
+      // 删除 empty placeholder,  只保留 solid gray background
+      promptParts.push(`Panel [row ${row}, col ${col}]: solid gray background`);
     }
     
     // Layer 3: 尾部风格强调（首尾夹击）

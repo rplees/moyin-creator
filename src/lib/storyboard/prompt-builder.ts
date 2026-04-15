@@ -81,7 +81,8 @@ export function buildStoryboardPrompt(config: StoryboardPromptConfig): string {
     for (let i = sceneCount; i < totalCells; i++) {
       const row = Math.floor(i / cols) + 1;
       const col = (i % cols) + 1;
-      promptParts.push(`Panel [row ${row}, col ${col}]: empty placeholder, solid gray background`);
+      // 删除 empty placeholder,  只保留 solid gray background
+      promptParts.push(`Panel [row ${row}, col ${col}]: solid gray background`);
     }
   }
   

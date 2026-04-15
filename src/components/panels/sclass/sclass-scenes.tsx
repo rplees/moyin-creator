@@ -2289,7 +2289,8 @@ export function SClassScenes({ onBack, onGenerateVideos }: SplitScenesProps) {
       for (let i = actualCount; i < paddedCount; i++) {
         const row = Math.floor(i / cols) + 1;
         const col = (i % cols) + 1;
-        gridPromptParts.push(`Panel [row ${row}, col ${col}]: empty placeholder, solid gray background`);
+        // 删除 empty placeholder,  只保留 solid gray background
+        gridPromptParts.push(`Panel [row ${row}, col ${col}]: solid gray background`);
       }
       
       // 5. 全局风格（尾部再次强调，首尾夹击确保风格一致性）
